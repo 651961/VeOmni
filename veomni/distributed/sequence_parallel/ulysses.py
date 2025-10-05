@@ -183,10 +183,14 @@ class _Slice(torch.autograd.Function):
     def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
         dim_size = list(grad_output.size())
         split_size = dim_size[0]
-        output = _all_gather(grad_output, group=ctx.group)
+        # output = _all_gather(grad_output, group=ctx.group)
+        # if ctx.scale_grad:
+        #     output = output / ctx.seq_world_size
+        # return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
+        output, _ = _all_gather(grad_output, group=ctx.group)
         if ctx.scale_grad:
-            output = output / ctx.seq_world_size
-        return (None, torch.cat(output.split(split_size), dim=ctx.dim), None, None)
+            output = [o / ctx.seq_world_size for o in output]
+        return (None, torch.cat(output, dim=ctx.dim), None, None)
 
 
 class _Gather(torch.autograd.Function):
