@@ -12,37 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import (
-    deepseek_v3,
-    flux,
-    janus,
-    llama,
-    movqgan,
-    qwen2,
-    qwen2_5_omni,
-    qwen2_5vl,
-    qwen2_vl,
-    qwen3,
-    qwen3_moe,
-    seed_oss,
-    wan,
-    wan2_2,
-)
+from transformers import AutoConfig
+
+from .config_wan2_2 import WanConfig2_2
+from .modeling_wan2_2 import WanModel2_2
 
 
-__all__ = [
-    "deepseek_v3",
-    "flux",
-    "janus",
-    "llama",
-    "movqgan",
-    "qwen2",
-    "qwen2_5_omni",
-    "qwen2_5vl",
-    "qwen2_vl",
-    "qwen3",
-    "qwen3_moe",
-    "seed_oss",
-    "wan",
-    "wan2_2",
-]
+AutoConfig.register("wan2_2", WanConfig2_2)
+
+__all__ = ["WanModel2_2", "WanConfig2_2"]
