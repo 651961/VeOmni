@@ -271,6 +271,7 @@ class RMSNorm(nn.Module):
 class AttentionModule(nn.Module):
     def __init__(self, config, num_heads, head_dim):
         super().__init__()
+        self.config = config
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.attention_interface = WAN_ATTENTION_FUNCTIONS[config._attn_implementation]
