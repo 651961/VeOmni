@@ -1,7 +1,7 @@
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -45,6 +45,34 @@ logger = helper.create_logger(__name__)
 
 
 @dataclass
+class MyModelArguments(ModelArguments):
+    lora_rank: int = field(
+        default=4,
+        metadata={"help": "The dimension of the LoRA update matrices."},
+    )
+    lora_alpha: float = field(
+        default=4.0,
+        metadata={"help": "The weight of the LoRA update matrices."},
+    )
+    lora_target_modules: str = field(
+        default="q,k,v,o,ffn.0,ffn.2",
+        metadata={"help": "Modules to train with LoRA (must be in lora_target_modules_support)."},
+    )
+    lora_target_modules_support: str = field(
+        default="q,k,v,o,ffn.0,ffn.2",
+        metadata={"help": "All modules supported by the model for LoRA training."},
+    )
+    init_lora_weights: Optional[Literal["kaiming", "full"]] = field(
+        default="kaiming",
+        metadata={"help": "Initialization method for LoRA weights."},
+    )
+    pretrained_lora_path: str = field(
+        default=None,
+        metadata={"help": "Pretrained LoRA path. Required if the training is resumed."},
+    )
+
+
+@dataclass
 class MyDataArguments(DataArguments):
     datasets_repeat: int = field(
         default=1,
@@ -61,6 +89,14 @@ class MyTrainingArguments(TrainingArguments):
     ops_to_save: List[str] = field(
         default_factory=list,
         metadata={"help": "Ops to save."},
+    )
+    vit_lr: float = field(
+        default=1e-6,
+        metadata={"help": "Learning rate for visual encoder parameters."},
+    )
+    train_architecture: Literal["lora", "full"] = field(
+        default="full",
+        metadata={"help": "Model structure to train. LoRA training or full training."},
     )
 
 
@@ -386,7 +422,7 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.6f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
             )
             data_loader_tqdm.update()
 
@@ -471,6 +507,7 @@ def save_hf_weights(args, save_checkpoint_path, model_assets):
         hf_weights_path,
         model_state_dict,
         model_assets=model_assets,
+        save_dtype="float32",
     )
     logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 
