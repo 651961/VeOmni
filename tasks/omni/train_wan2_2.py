@@ -104,7 +104,7 @@ class MyTrainingArguments(TrainingArguments):
 
 @dataclass
 class Arguments:
-    model: ModelArguments = field(default_factory=ModelArguments)
+    model: MyModelArguments = field(default_factory=MyModelArguments)
     data: MyDataArguments = field(default_factory=MyDataArguments)
     train: MyTrainingArguments = field(default_factory=MyTrainingArguments)
 
@@ -399,15 +399,21 @@ def main():
                 y = image_emb["y"].to(model.dtype)
                 # predict noise
                 with model_fwd_context:
+                    batch_seqlens = environ_meter.batch_seqlens
+                    if isinstance(batch_seqlens, torch.Tensor):
+                        max_seq_len = batch_seqlens.max().item()
+                    else:
+                        max_seq_len = max(batch_seqlens)
+
                     noise_pred = model.forward(
                         x=noisy_latents,
                         t=timestep,
                         context=context,
-                        seq_len=environ_meter.batch_seqlens[0],
+                        seq_len=max_seq_len,
                         y=y,
                     )
                     # MSE loss with weights
-                    loss = F.mse_loss(noise_pred[0].float(), training_target.float(), reduction="none")
+                    loss = F.mse_loss(noise_pred[0].float(), training_target.squeeze(0).float(), reduction="none")
                     weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
                     # shape: [B, ...], weight: [B]
                     loss = (loss.view(latents.size(0), -1).mean(dim=1) * weight).mean() / len(micro_batches)
@@ -437,7 +443,7 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.6f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s"
             )
             data_loader_tqdm.update()
 
@@ -521,6 +527,7 @@ def save_hf_weights(args, save_checkpoint_path, model_assets):
         hf_weights_path,
         model_state_dict,
         model_assets=model_assets,
+        save_dtype="float32",
     )
     logger.info_rank0(f"Huggingface checkpoint saved at {hf_weights_path} successfully!")
 

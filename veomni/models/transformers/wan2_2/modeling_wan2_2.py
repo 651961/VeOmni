@@ -686,7 +686,7 @@ class WanModel2_2(PreTrainedModel):
 
 
 if is_liger_kernel_available():
-    RMSNorm = LigerRMSNorm
+    WanRMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to Wan2.2.")
 
 ModelClass = WanModel2_2
