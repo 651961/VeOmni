@@ -102,7 +102,7 @@ class MyTrainingArguments(TrainingArguments):
 
 @dataclass
 class Arguments:
-    model: ModelArguments = field(default_factory=ModelArguments)
+    model: MyModelArguments = field(default_factory=MyModelArguments)
     data: MyDataArguments = field(default_factory=MyDataArguments)
     train: MyTrainingArguments = field(default_factory=MyTrainingArguments)
 
