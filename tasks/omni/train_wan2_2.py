@@ -89,11 +89,11 @@ class MyTrainingArguments(TrainingArguments):
         metadata={"help": "Learning rate for visual encoder parameters."},
     )
     max_timestep_boundary: float = field(
-        default=1.0,
+        default=0.358,
         metadata={"help": "Max timestep boundary for diffusion model."},
     )
     min_timestep_boundary: float = field(
-        default=0.875,
+        default=0,
         metadata={"help": "Min timestep boundary for diffusion model."},
     )
     train_architecture: Literal["lora", "full"] = field(
@@ -382,7 +382,6 @@ def main():
 
                 noise = torch.randn_like(latents)
                 timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
-                # timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype, latents.device)
                 timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype).to(latents.device)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(
@@ -394,7 +393,6 @@ def main():
                 )
                 noisy_latents = noisy_latents.to(model.dtype)
                 training_target = flow_scheduler.training_target(latents, noise, timestep)
-                # input["timesteps"] = timestep
                 context = prompt_emb["context"].to(model.dtype)
                 y = image_emb["y"].to(model.dtype)
                 # predict noise
