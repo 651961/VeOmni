@@ -18,7 +18,7 @@ import math
 import torch
 import torch.nn as nn
 from transformers.modeling_utils import PreTrainedModel
-
+import torch.nn.functional as F
 from veomni.distributed.parallel_state import get_parallel_state
 from veomni.distributed.sequence_parallel import (
     gather_heads_scatter_seq,
@@ -260,7 +260,15 @@ class WanLayerNorm(nn.LayerNorm):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        return super().forward(x.float()).type_as(x)
+        orig_dtype = x.dtype
+        x = x.float()
+
+        weight = self.weight.float() if self.weight is not None else None
+        bias = self.bias.float() if self.bias is not None else None
+
+        x = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+
+        return x.type(orig_dtype)
 
 
 class WanSelfAttention(nn.Module):
@@ -358,11 +366,11 @@ class WanAttentionBlock(nn.Module):
         self.eps = eps
 
         # layers
-        self.norm1 = nn.LayerNorm(dim, eps)
+        self.norm1 = WanLayerNorm(dim, eps)
         self.self_attn = WanSelfAttention(dim, num_heads, window_size, qk_norm, eps)
-        self.norm3 = nn.LayerNorm(dim, eps) if cross_attn_norm else nn.Identity()
+        self.norm3 = WanLayerNorm(dim, eps, elementwise_affine=True) if cross_attn_norm else nn.Identity()
         self.cross_attn = WanCrossAttention(dim, num_heads, (-1, -1), qk_norm, eps)
-        self.norm2 = nn.LayerNorm(dim, eps)
+        self.norm2 = WanLayerNorm(dim, eps)
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(approximate="tanh"), nn.Linear(ffn_dim, dim))
 
         # modulation
@@ -426,7 +434,7 @@ class Head(nn.Module):
 
         # layers
         out_dim = math.prod(patch_size) * out_dim
-        self.norm = nn.LayerNorm(dim, eps)
+        self.norm = WanLayerNorm(dim, eps)
         self.head = nn.Linear(dim, out_dim)
 
         # modulation
