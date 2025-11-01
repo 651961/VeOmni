@@ -44,7 +44,7 @@ __all__ = [
     "qwen3",
     "qwen3_moe",
     "seed_oss",
-    "wan",
     "wan2_2",
+    "wan",
     "qwen3_vl",
 ]
