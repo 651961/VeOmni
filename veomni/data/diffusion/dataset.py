@@ -48,6 +48,28 @@ class TensorDataset(torch.utils.data.Dataset):
         return len(self.path) * self.datasets_repeat
 
 
+class DPOTensorDataset(torch.utils.data.Dataset):
+    def __init__(self, base_path, metadata_path, datasets_repeat=1):
+        metadata = pd.read_csv(metadata_path)
+        self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
+        logger.info_rank0(f"{len(self.path)} videos in metadata.")
+        self.path = [i + ".tensors.pth" for i in self.path if os.path.exists(i + ".tensors.pth")]
+        logger.info_rank0(f"{len(self.path)} tensors cached in metadata.")
+        assert len(self.path) > 0
+        self.datasets_repeat = datasets_repeat
+
+    def __getitem__(self, index):
+        data_id = (index) % len(self.path)  # For fixed seed.
+        path = self.path[data_id]
+        data = torch.load(path, weights_only=True, map_location="cpu")
+        data["latents"] = data["latents"].squeeze(0)
+        data["latents_reject"] = data["latents_reject"].squeeze(0)
+        return [data]
+
+    def __len__(self):
+        return len(self.path) * self.datasets_repeat
+
+
 class Text2ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -97,6 +119,10 @@ class Text2ImageDataset(torch.utils.data.Dataset):
 
 def build_tensor_dataset(base_path, metadata_path, datasets_repeat=1):
     return TensorDataset(base_path, metadata_path, datasets_repeat)
+
+
+def build_dpo_tensor_dataset(base_path, metadata_path, datasets_repeat=1):
+    return DPOTensorDataset(base_path, metadata_path, datasets_repeat)
 
 
 def build_text_image_dataset(base_path, metadata_path, height, width, center_crop, random_flip, datasets_repeat=1):
