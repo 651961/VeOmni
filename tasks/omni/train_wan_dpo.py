@@ -11,7 +11,7 @@ from tqdm import trange
 
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
 from veomni.data.diffusion.data_loader import build_dit_dataloader
-from veomni.data.diffusion.dataset import build_tensor_dataset
+from veomni.data.diffusion.dataset import build_dpo_tensor_dataset
 from veomni.distributed.offloading import build_activation_offloading_context
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
@@ -155,7 +155,7 @@ def main():
     )
 
     if args.data.data_type == "diffusion":
-        train_dataset = build_tensor_dataset(
+        train_dataset = build_dpo_tensor_dataset(
             base_path=args.data.train_path,
             metadata_path=os.path.join(args.data.train_path, "metadata.csv"),
             datasets_repeat=args.data.datasets_repeat,
@@ -395,8 +395,8 @@ def main():
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch, model_type="wan")
 
-                chosen_latents = micro_batch["chosen_latents"].to(model.device)
-                rejected_latents = micro_batch["rejected_latents"].to(model.device)
+                chosen_latents = micro_batch["latents"].to(model.device)
+                rejected_latents = micro_batch["latents_reject"].to(model.device)
                 prompt_emb = micro_batch["prompt_emb"]
 
                 if args.train.micro_batch_size > 1:
