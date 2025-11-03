@@ -1,0 +1,63 @@
+model:
+  model_path: /data/ckpt_zsqiao/Wan2.1-I2V-14B-720P-SFT-Merge
+  config_path: ./configs/model_configs/wan/wani2v_14b.json
+  attn_implementation: flash_attention_2
+  lora_target_modules: q,k,v,o,ffn.0,ffn.2
+  lora_target_modules_support: q,k,v,o,ffn.0,ffn.2
+  lora_rank: 128
+  lora_alpha: 128
+
+data:
+  train_path: /codes/dazhaohu_dpo
+  train_size: 1000000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: diffusion
+  # max_seq_len: 8192
+  text_keys: text
+  drop_last: true
+  datasets_repeat: 1
+
+train:
+  output_dir: /data/ckpt_zsqiao/veomni_dpo_lora_wan2.1_i2v_14b_720p_dazhaohu_v2
+  train_architecture: lora
+  dpo_beta: 5000
+  data_parallel_mode: fsdp1
+  ulysses_parallel_size: 1
+  global_batch_size: 16
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.005
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  seed: 42
+  optimizer: adamw
+  lr: 5.0e-5
+  lr_warmup_ratio: 0.005
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: true
+  enable_activation_offload: true
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: bytecheckpoint
+  load_checkpoint_path: ""
+  max_steps: 1000
+  save_epochs: 1
+  num_train_epochs: 10
+  save_hf_weights: true
+  use_wandb: false
+  wandb_project: VeOmni-SFT-LoRA-Wan2.1-I2V-14B-720P
+  wandb_name: veomni_sft_lora_wan2.1_i2v_14b_720p
+  ops_to_save:
+    # - aten.addmm.default
+    - torch.ops.flash_attn._flash_attn_forward.default
+    - aten._scaled_dot_product_flash_attention.default
+    - torch.ops.flash_attn_3.fwd.default
