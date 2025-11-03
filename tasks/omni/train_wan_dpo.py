@@ -102,6 +102,8 @@ class MyTrainingArguments(TrainingArguments):
         default=5000,
         metadata={"help": "DPO Beta"},
     )
+    ref_cpu_offload: bool = field(default=True, metadata={"help": "FSDP CPU offload for reference model only."})
+    ref_inference_mode: bool = field(default=True, metadata={"help": "Use inference_mode for ref forward."})
 
 
 @dataclass
@@ -124,6 +126,24 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
         {"params": vit_params, "lr": vit_lr},
         {"params": other_params, "lr": default_lr},
     ]
+
+
+def per_sample_mse_bf16(pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor):
+    device = pred.device
+    dtype = pred.dtype
+
+    if target.device != device or target.dtype != dtype:
+        target = target.to(device=device, dtype=dtype, non_blocking=True)
+
+    B = pred.size(0)
+    pred_ = pred[:, :, 1:, :, :]
+    target_ = target[:, :, 1:, :, :]
+
+    diff = pred_ - target_
+    mse = diff.mul(diff).reshape(B, -1).mean(dim=1)  # [B], bf16
+
+    weight = weight.to(device=device, dtype=torch.float32, non_blocking=True)
+    return mse.to(torch.float32) * weight  # [B], fp32
 
 
 def main():
@@ -196,15 +216,13 @@ def main():
     logger.info_rank0("Building DPO reference model...")
     ref_model = build_foundation_model(
         config_path=args.model.config_path,
-        weights_path=args.model.model_path,  # 使用相同的初始权重
-        init_device=args.train.init_device,
+        weights_path=args.model.model_path,
+        init_device="cpu" if args.train.ref_cpu_offload else args.train.init_device,
         torch_dtype="bfloat16",
         attn_implementation=args.model.attn_implementation,
         force_use_huggingface=args.model.force_use_huggingface,
     )
     ref_model.micro_batch_size = args.train.micro_batch_size
-
-    # freeze reference model
     for param in ref_model.parameters():
         param.requires_grad = False
     ref_model.eval()
@@ -257,17 +275,16 @@ def main():
         use_orig_params=_use_orig_params,
         ops_to_save=ops_to_save,
     )
-
-    # parallelize ref_model
     ref_model = build_parallelize_model(
         ref_model,
-        enable_full_shard=args.train.enable_full_shard,
-        enable_mixed_precision=args.train.enable_mixed_precision,
+        enable_full_shard=True,
+        enable_mixed_precision=True,
         enable_gradient_checkpointing=False,
-        init_device=args.train.init_device,
-        enable_fsdp_offload=args.train.enable_fsdp_offload,
+        init_device="cpu" if args.train.ref_cpu_offload else args.train.init_device,
+        enable_fsdp_offload=args.train.ref_cpu_offload or args.train.enable_fsdp_offload,
         basic_modules=ref_model._no_split_modules,
-        use_orig_params=_use_orig_params,
+        use_orig_params=False,
+        param_dtype="bfloat16",
     )
 
     optimizer = build_optimizer(
@@ -302,7 +319,6 @@ def main():
         )
         profiler.start()
 
-    # Build diffusion scheduler: FlowMatchScheduler
     flow_scheduler = FlowMatchScheduler(
         shift=5,
         sigma_min=0.0,
@@ -330,7 +346,7 @@ def main():
     )
 
     if args.train.load_checkpoint_path:
-        state = {"model": model, "optimizer": optimizer, "extra_state": {}}  # cannot be None
+        state = {"model": model, "optimizer": optimizer, "extra_state": {}}
         Checkpointer.load(args.train.load_checkpoint_path, state)
         global_step = state["extra_state"]["global_step"]
         start_epoch = global_step // args.train.train_steps
@@ -339,8 +355,8 @@ def main():
         train_dataloader.load_state_dict(state["extra_state"]["train_dataloader"])
         environ_meter.load_state_dict(state["extra_state"]["environ_meter"])
         torch.set_rng_state(state["extra_state"]["torch_rng_state"])
-        if start_step == 0:  # resume at the end of epoch
-            iter(train_dataloader)  # clear resume state and prefetch data
+        if start_step == 0:
+            iter(train_dataloader)
 
         dist.barrier()
         logger.info_rank0(f"Load distributed checkpoint from {args.train.load_checkpoint_path} successfully!")
@@ -360,6 +376,7 @@ def main():
     )
 
     flow_scheduler.set_timesteps(1000, training=True)
+    ref_infer_ctx = torch.inference_mode() if args.train.ref_inference_mode else torch.no_grad()
 
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
@@ -417,8 +434,8 @@ def main():
                 noise = torch.randn_like(chosen_latents)
                 timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (chosen_latents.size(0),))
                 timestep = flow_scheduler.timesteps[timestep_id].to(chosen_latents.dtype).to(chosen_latents.device)
+                weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
 
-                # chosen noise and target
                 noisy_chosen_latents = flow_scheduler.add_noise(
                     chosen_latents,
                     noise,
@@ -427,8 +444,10 @@ def main():
                     args.train.enable_mixed_precision,
                 )
                 training_target_chosen = flow_scheduler.training_target(chosen_latents, noise, timestep)
+                training_target_chosen = training_target_chosen.to(
+                    device=chosen_latents.device, dtype=chosen_latents.dtype, non_blocking=True
+                )
 
-                # reject noise and target
                 noisy_rejected_latents = flow_scheduler.add_noise(
                     rejected_latents,
                     noise,
@@ -437,6 +456,10 @@ def main():
                     args.train.enable_mixed_precision,
                 )
                 training_target_rejected = flow_scheduler.training_target(rejected_latents, noise, timestep)
+                training_target_rejected = training_target_rejected.to(
+                    device=rejected_latents.device, dtype=rejected_latents.dtype, non_blocking=True
+                )
+                del noise
 
                 # predict noise
                 with model_fwd_context:
@@ -446,56 +469,35 @@ def main():
                         **prompt_emb,
                         **image_emb,
                     )
+                    loss_chosen_policy = per_sample_mse_bf16(noise_pred_chosen_policy, training_target_chosen, weight)
+
                     noise_pred_rejected_policy = model.forward(
                         noisy_rejected_latents,
                         timestep=timestep,
                         **prompt_emb,
                         **image_emb,
                     )
+                    loss_rejected_policy = per_sample_mse_bf16(
+                        noise_pred_rejected_policy, training_target_rejected, weight
+                    )
+                    del noise_pred_chosen_policy, noise_pred_rejected_policy
 
-                    with torch.no_grad():
+                    with ref_infer_ctx:
                         noise_pred_chosen_ref = ref_model.forward(
-                            noisy_chosen_latents,
-                            timestep=timestep,
-                            **prompt_emb,
-                            **image_emb,
+                            noisy_chosen_latents, timestep=timestep, **prompt_emb, **image_emb
                         )
+                        loss_chosen_ref = per_sample_mse_bf16(noise_pred_chosen_ref, training_target_chosen, weight)
+
                         noise_pred_rejected_ref = ref_model.forward(
-                            noisy_rejected_latents,
-                            timestep=timestep,
-                            **prompt_emb,
-                            **image_emb,
+                            noisy_rejected_latents, timestep=timestep, **prompt_emb, **image_emb
                         )
+                        loss_rejected_ref = per_sample_mse_bf16(
+                            noise_pred_rejected_ref, training_target_rejected, weight
+                        )
+                        del noise_pred_chosen_ref, noise_pred_rejected_ref
 
-                    # MSE loss with weights
-                    B = chosen_latents.size(0)
-                    weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
-
-                    # loss_chosen_policy
-                    loss_chosen_policy = F.mse_loss(
-                        noise_pred_chosen_policy.float(), training_target_chosen.float(), reduction="none"
-                    )
-                    loss_chosen_policy = loss_chosen_policy[:, :, 1:, :, :].reshape(B, -1).mean(dim=1) * weight  # [B]
-
-                    # loss_rejected_policy
-                    loss_rejected_policy = F.mse_loss(
-                        noise_pred_rejected_policy.float(), training_target_rejected.float(), reduction="none"
-                    )
-                    loss_rejected_policy = (
-                        loss_rejected_policy[:, :, 1:, :, :].reshape(B, -1).mean(dim=1) * weight
-                    )  # [B]
-
-                    # loss_chosen_ref
-                    loss_chosen_ref = F.mse_loss(
-                        noise_pred_chosen_ref.float(), training_target_chosen.float(), reduction="none"
-                    )
-                    loss_chosen_ref = loss_chosen_ref[:, :, 1:, :, :].reshape(B, -1).mean(dim=1) * weight  # [B]
-
-                    # loss_rejected_ref
-                    loss_rejected_ref = F.mse_loss(
-                        noise_pred_rejected_ref.float(), training_target_rejected.float(), reduction="none"
-                    )
-                    loss_rejected_ref = loss_rejected_ref[:, :, 1:, :, :].reshape(B, -1).mean(dim=1) * weight  # [B]
+                    del prompt_emb, image_emb, noisy_chosen_latents, training_target_chosen
+                    del noisy_rejected_latents, training_target_rejected
 
                     diff_policy = loss_chosen_policy - loss_rejected_policy  # [B]
                     diff_ref = loss_chosen_ref - loss_rejected_ref  # [B]
@@ -611,7 +613,6 @@ def main():
                 save_hf_weights(args, save_checkpoint_path, model_assets)
 
     synchronize()
-    # release memory
     del optimizer, lr_scheduler
     helper.empty_cache()
 
