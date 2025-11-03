@@ -613,8 +613,8 @@ class TrainingArguments:
                 f"`global_batch_size` should be a multiple of {self.micro_batch_size * self.data_parallel_size}."
             )
 
-        if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
-            raise ValueError("Gradient accumulation is not supported with FSDP offload.")
+        # if self.gradient_accumulation_steps > 1 and self.enable_fsdp_offload:
+        #     raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # calculate dataloader batch size (for StreamingDataset and StreamingDataLoader)
         if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker":
