@@ -1,6 +1,6 @@
 model:
-  model_path: /data/models/Wan2.1-I2V-14B-720P
-  config_path: ./configs/model_configs/wan/wani2v_14b.json
+  model_path: /data/models/Wan2.2-I2V-A14B/low_noise_model
+  config_path: ./configs/model_configs/wan/wan2_2_i2v_a14b.json
   attn_implementation: flash_attention_2
   lora_target_modules: q,k,v,o,ffn.0,ffn.2
   lora_target_modules_support: q,k,v,o,ffn.0,ffn.2
@@ -18,7 +18,7 @@ data:
   datasets_repeat: 1
 
 train:
-  output_dir: /data/ckpt_zsqiao/sft_lora_shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4_2026exp
+  output_dir: /data/ckpt_zsqiao/sft_lora_low_noise_model_shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4
   train_architecture: lora
   data_parallel_mode: fsdp1
   data_parallel_replicate_size: 1
@@ -53,8 +53,10 @@ train:
   num_train_epochs: 200
   save_hf_weights: true
   use_wandb: false
-  wandb_project: SFT-LoRA-Wan2.1-I2V-14B-720P
-  wandb_name: sft_lora_wan2_1_i2v_14b_720p
+  wandb_project: SFT-LoRA-Wan2.2-I2V-A14B
+  wandb_name: sft_lora_wan2_2_i2v_a14b
+  max_timestep_boundary: 1.0
+  min_timestep_boundary: 0.358
   ops_to_save:
     # - aten.addmm.default
     - torch.ops.flash_attn._flash_attn_forward.default

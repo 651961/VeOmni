@@ -1,3 +1,4 @@
+# Copyright 2024-2025 The Black-forest-labs Authors. All rights reserved.
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -11,42 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from . import (
-    deepseek_v3,
-    flux,
-    janus,
-    llama,
-    movqgan,
-    qwen2,
-    qwen2_5_omni,
-    qwen2_5vl,
-    qwen2_vl,
-    qwen3,
-    qwen3_moe,
-    qwen3_vl,
-    qwen3_vl_moe,
-    seed_oss,
-    wan2_2,
-    wan,
-)
+from ...loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 
 
-__all__ = [
-    "deepseek_v3",
-    "flux",
-    "janus",
-    "llama",
-    "movqgan",
-    "qwen2",
-    "qwen2_5_omni",
-    "qwen2_5vl",
-    "qwen2_vl",
-    "qwen3",
-    "qwen3_moe",
-    "seed_oss",
-    "wan2_2",
-    "wan",
-    "qwen3_vl",
-    "qwen3_vl_moe",
-]
+@MODEL_CONFIG_REGISTRY.register("wan2_2")
+def register_wan2_2_config():
+    from .config_wan2_2 import WanConfig2_2
+
+    return WanConfig2_2
+
+
+@MODELING_REGISTRY.register("wan2_2")
+def register_wan2_2_modeling(architecture: str):
+    from .modeling_wan2_2 import WanModel2_2
+
+    return WanModel2_2

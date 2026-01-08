@@ -1,6 +1,6 @@
 model:
-  model_path: /data/models/Wan2.1-I2V-14B-720P
-  config_path: ./configs/model_configs/wan/wani2v_14b.json
+  model_path: /data/models/Qwen-Image-Edit-2511
+  config_path: ./configs/model_configs/qwen/Qwen-Image-Edit-2511.json
   attn_implementation: flash_attention_2
   lora_target_modules: q,k,v,o,ffn.0,ffn.2
   lora_target_modules_support: q,k,v,o,ffn.0,ffn.2
@@ -53,8 +53,8 @@ train:
   num_train_epochs: 200
   save_hf_weights: true
   use_wandb: false
-  wandb_project: SFT-LoRA-Wan2.1-I2V-14B-720P
-  wandb_name: sft_lora_wan2_1_i2v_14b_720p
+  wandb_project: SFT-LoRA-Qwen-Image-Edit-2511
+  wandb_name: sft_lora_qwen_image_edit_2511
   ops_to_save:
     # - aten.addmm.default
     - torch.ops.flash_attn._flash_attn_forward.default

@@ -99,6 +99,14 @@ class MyTrainingArguments(TrainingArguments):
         default="full",
         metadata={"help": "Model structure to train. LoRA training or full training."},
     )
+    max_timestep_boundary: float = field(
+        default=0.358,
+        metadata={"help": "Max timestep boundary for diffusion model."},
+    )
+    min_timestep_boundary: float = field(
+        default=0,
+        metadata={"help": "Min timestep boundary for diffusion model."},
+    )
 
 
 @dataclass
@@ -358,26 +366,34 @@ def main():
                 break
 
             for micro_batch in micro_batches:
-                environ_meter.add(micro_batch, model_type="wan")
+                environ_meter.add(micro_batch, model_type="wan2_2")
+                max_timestep_boundary = int(
+                    (args.train.max_timestep_boundary if args.train.max_timestep_boundary is not None else 1)
+                    * flow_scheduler.num_train_timesteps
+                )
+                min_timestep_boundary = int(
+                    (args.train.min_timestep_boundary if args.train.min_timestep_boundary is not None else 0)
+                    * flow_scheduler.num_train_timesteps
+                )
                 latents = micro_batch["latents"].to(model.device)
                 prompt_emb = micro_batch["prompt_emb"]
                 if args.train.micro_batch_size > 1:
                     prompt_emb["context"] = prompt_emb["context"].squeeze(1).to(model.device)
                     image_emb = micro_batch["image_emb"]
-                    if "clip_feature" in image_emb:
-                        image_emb["clip_feature"] = image_emb["clip_feature"].squeeze(1).to(model.device)
+                    # if "clip_feature" in image_emb:
+                    #     image_emb["clip_feature"] = image_emb["clip_feature"].squeeze(1).to(model.device)
                     if "y" in image_emb:
                         image_emb["y"] = image_emb["y"].squeeze(1).to(model.device)
                 else:
                     prompt_emb["context"] = prompt_emb["context"][0].to(model.device)
                     image_emb = micro_batch["image_emb"]
-                    if "clip_feature" in image_emb:
-                        image_emb["clip_feature"] = image_emb["clip_feature"][0].to(model.device)
+                    # if "clip_feature" in image_emb:
+                    #     image_emb["clip_feature"] = image_emb["clip_feature"][0].to(model.device)
                     if "y" in image_emb:
                         image_emb["y"] = image_emb["y"][0].to(model.device)
 
                 noise = torch.randn_like(latents)
-                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (latents.size(0),))
+                timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (latents.size(0),))
                 timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype).to(latents.device)
                 # noise and target
                 noisy_latents = flow_scheduler.add_noise(

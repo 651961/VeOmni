@@ -107,6 +107,8 @@ class EnvironMeter(OriginalEnvironMeter):
     def add(self, micro_batch: Dict[str, "torch.Tensor"], model_type: Optional[str] = None) -> None:
         if model_type == "wan":
             seqlens = _compute_wan_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids)
+        if model_type == "wan2_2":
+            seqlens = _compute_wan_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids)
         elif model_type == "flux":
             seqlens = _compute_flux_seqlens(micro_batch)
         else:
