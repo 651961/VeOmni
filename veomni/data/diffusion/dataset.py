@@ -48,6 +48,33 @@ class TensorDataset(torch.utils.data.Dataset):
         return len(self.path) * self.datasets_repeat
 
 
+class QwenImageEdit2511TensorDataset(torch.utils.data.Dataset):
+    def __init__(self, base_path, metadata_path, datasets_repeat=1):
+        metadata = pd.read_csv(metadata_path)
+        self.path = [os.path.join(base_path, "train", file_name) for file_name in metadata["file_name"]]
+        self.path = [i for i in self.path if os.path.exists(i)]
+        logger.info_rank0(f"{len(self.path)} tensors cached images in metadata.")
+        assert len(self.path) > 0
+        self.datasets_repeat = datasets_repeat
+
+    def __getitem__(self, index):
+        data_id = (index) % len(self.path)
+        path = self.path[data_id]
+        data = torch.load(path, weights_only=False, map_location="cpu")
+        image_dict, prompt_dict, negative_prompt_dict = data
+        combined = {
+            "latents": image_dict["input_latents"].squeeze(0),
+            "edit_latents": [x.squeeze(0) for x in image_dict["edit_latents"]],
+            "height": image_dict["height"],
+            "width": image_dict["width"],
+            "prompt_emb": prompt_dict["prompt_emb"].squeeze(0),
+            "prompt_emb_mask": prompt_dict["prompt_emb_mask"].squeeze(0),
+        }
+        return [combined]
+
+    def __len__(self):
+        return len(self.path) * self.datasets_repeat
+
 class Text2ImageDataset(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -97,6 +124,10 @@ class Text2ImageDataset(torch.utils.data.Dataset):
 
 def build_tensor_dataset(base_path, metadata_path, datasets_repeat=1):
     return TensorDataset(base_path, metadata_path, datasets_repeat)
+
+
+def build_qwen_image_edit_2511_tensor_dataset(base_path, metadata_path, datasets_repeat=1):
+    return QwenImageEdit2511TensorDataset(base_path, metadata_path, datasets_repeat)
 
 
 def build_text_image_dataset(base_path, metadata_path, height, width, center_crop, random_flip, datasets_repeat=1):

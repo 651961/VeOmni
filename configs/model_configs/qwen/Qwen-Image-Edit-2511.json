@@ -14,6 +14,8 @@
   "num_layers": 60,
   "out_channels": 16,
   "patch_size": 2,
+  "use_additional_t_cond": false,
+  "use_layer3d_rope": false,
   "zero_cond_t": true,
   "tie_word_embeddings": false,
   "model_type": "qwen_image_edit_2511"

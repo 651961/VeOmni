@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
+
 import torch
 
 
@@ -26,6 +28,9 @@ class FlowMatchScheduler:
         inverse_timesteps=False,
         extra_one_step=False,
         reverse_sigmas=False,
+        # Qwen-Image 参数
+        use_exponential_shift=False,
+        shift_terminal=None,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.shift = shift
@@ -34,9 +39,28 @@ class FlowMatchScheduler:
         self.inverse_timesteps = inverse_timesteps
         self.extra_one_step = extra_one_step
         self.reverse_sigmas = reverse_sigmas
+
+        self.use_exponential_shift = use_exponential_shift
+        self.shift_terminal = shift_terminal
+
         self.set_timesteps(num_inference_steps)
 
-    def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False, shift=None):
+    @staticmethod
+    def _calculate_shift_qwen_image(image_seq_len, base_seq_len=256, max_seq_len=8192, base_shift=0.5, max_shift=0.9):
+        m = (max_shift - base_shift) / (max_seq_len - base_seq_len)
+        b = base_shift - m * base_seq_len
+        mu = image_seq_len * m + b
+        return mu
+
+    def set_timesteps(
+        self,
+        num_inference_steps=100,
+        denoising_strength=1.0,
+        training=False,
+        shift=None,
+        dynamic_shift_len=None,
+        exponential_shift_mu=None,
+    ):
         if shift is not None:
             self.shift = shift
         sigma_start = self.sigma_min + (self.sigma_max - self.sigma_min) * denoising_strength
@@ -46,7 +70,25 @@ class FlowMatchScheduler:
             self.sigmas = torch.linspace(sigma_start, self.sigma_min, num_inference_steps)
         if self.inverse_timesteps:
             self.sigmas = torch.flip(self.sigmas, dims=[0])
-        self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+
+        if self.use_exponential_shift:
+            # 优先级: exponential_shift_mu > dynamic_shift_len > 0.8
+            if exponential_shift_mu is not None:
+                mu = exponential_shift_mu
+            elif dynamic_shift_len is not None:
+                mu = self._calculate_shift_qwen_image(dynamic_shift_len)
+            else:
+                mu = 0.8  # 训练时用 0.8
+
+            self.sigmas = math.exp(mu) / (math.exp(mu) + (1 / self.sigmas - 1))
+
+            if self.shift_terminal is not None:
+                one_minus_z = 1 - self.sigmas
+                scale_factor = one_minus_z[-1] / (1 - self.shift_terminal)
+                self.sigmas = 1 - (one_minus_z / scale_factor)
+        else:
+            self.sigmas = self.shift * self.sigmas / (1 + (self.shift - 1) * self.sigmas)
+
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
@@ -71,14 +113,6 @@ class FlowMatchScheduler:
             sigma_ = self.sigmas[timestep_id + 1]
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
-
-    def return_to_timestep(self, timestep, sample, sample_stablized):
-        if isinstance(timestep, torch.Tensor):
-            timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
-        model_output = (sample - sample_stablized) / sigma
-        return model_output
 
     def add_noise(self, original_samples, noise, timestep, micro_batch_size, enable_mixed_precision):
         if isinstance(timestep, torch.Tensor):

@@ -72,6 +72,35 @@ def _compute_wan_seqlens(
     return [seqlens]
 
 
+def _compute_qwen_image_edit_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> List[int]:
+    """
+    Computes the sequence lengths of the current batch for QwenImageEdit2511 model.
+
+    Args:
+        micro_batch (Dict[str, Tensor]): The current batch.
+    """
+    latents = micro_batch["latents"]
+    B, C, H, W = latents.shape
+    # QwenImageEdit2511 的 patchify: H // 16, W // 16 (patch size = 2 on latent)
+    # latent 尺寸已经是原图 / 8，再 / 2 = 原图 / 16
+    H_out = H // 2
+    W_out = W // 2
+    seqlens = B * H_out * W_out
+
+    # 如果有 edit_latents，也需要计算
+    if "edit_latents" in micro_batch and micro_batch["edit_latents"] is not None:
+        edit_latents = micro_batch["edit_latents"]
+        if isinstance(edit_latents, list):
+            for el in edit_latents:
+                _, _, eh, ew = el.shape
+                seqlens += el.shape[0] * (eh // 2) * (ew // 2)
+        else:
+            _, _, eh, ew = edit_latents.shape
+            seqlens += edit_latents.shape[0] * (eh // 2) * (ew // 2)
+
+    return [seqlens]
+
+
 def _compute_flux_seqlens(micro_batch: Dict[str, "torch.Tensor"]) -> Tuple[List[int], Optional[List[int]]]:
     """
     Computes the sequence lengths of the current batch.
@@ -107,8 +136,10 @@ class EnvironMeter(OriginalEnvironMeter):
     def add(self, micro_batch: Dict[str, "torch.Tensor"], model_type: Optional[str] = None) -> None:
         if model_type == "wan":
             seqlens = _compute_wan_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids)
-        if model_type == "wan2_2":
+        elif model_type == "wan2_2":
             seqlens = _compute_wan_seqlens(micro_batch, self.rmpad, self.rmpad_with_pos_ids)
+        elif model_type == "qwen_image_edit_2511":
+            seqlens = _compute_qwen_image_edit_seqlens(micro_batch)
         elif model_type == "flux":
             seqlens = _compute_flux_seqlens(micro_batch)
         else:

@@ -198,7 +198,7 @@ def main():
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
-    lora_target_modules_support = ["q", "k", "v", "o", "ffn.0", "ffn.2"]
+    lora_target_modules_support = args.model.lora_target_modules_support.split(",")
     if args.train.train_architecture == "lora":
         logger.info_rank0("train_architecture is lora")
         _use_orig_params = True

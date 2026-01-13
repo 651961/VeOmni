@@ -99,6 +99,16 @@ class MyTrainingArguments(TrainingArguments):
         default="full",
         metadata={"help": "Model structure to train. LoRA training or full training."},
     )
+    dpo_beta: int = field(
+        default=5000,
+        metadata={"help": "DPO Beta"},
+    )
+    rpo_alpha: int = field(
+        default=0.1,
+        metadata={"help": "controls the weight of the SFT loss"},
+    )
+    ref_cpu_offload: bool = field(default=True, metadata={"help": "FSDP CPU offload for reference model only."})
+    ref_inference_mode: bool = field(default=True, metadata={"help": "Use inference_mode for ref forward."})
 
 
 @dataclass
@@ -121,6 +131,24 @@ def get_param_groups(model: torch.nn.Module, default_lr: float, vit_lr: float):
         {"params": vit_params, "lr": vit_lr},
         {"params": other_params, "lr": default_lr},
     ]
+
+
+def caculate_mse_loss(pred: torch.Tensor, target: torch.Tensor, weight: torch.Tensor):
+    device = pred.device
+    dtype = pred.dtype
+
+    if target.device != device or target.dtype != dtype:
+        target = target.to(device=device, dtype=dtype, non_blocking=True)
+
+    B = pred.size(0)
+    pred_ = pred[:, :, 1:, :, :]
+    target_ = target[:, :, 1:, :, :]
+
+    diff = pred_ - target_
+    mse = diff.mul(diff).reshape(B, -1).mean(dim=1)  # [B], bf16
+
+    weight = weight.to(device=device, dtype=torch.float32, non_blocking=True)
+    return mse.to(torch.float32) * weight  # [B], fp32
 
 
 def main():
@@ -178,6 +206,7 @@ def main():
     else:
         raise NotImplementedError(f"Unsupported data type: {args.data.data_type}.")
 
+    # policy model
     model = build_foundation_model(
         config_path=args.model.config_path,
         weights_path=args.model.model_path,
@@ -187,10 +216,25 @@ def main():
     )
     model.micro_batch_size = args.train.micro_batch_size
 
+    # reference model
+    logger.info_rank0("Building DPO reference model...")
+    ref_model = build_foundation_model(
+        config_path=args.model.config_path,
+        weights_path=args.model.model_path,
+        init_device="cpu" if args.train.ref_cpu_offload else args.train.init_device,
+        torch_dtype="bfloat16",
+        attn_implementation=args.model.attn_implementation,
+    )
+    ref_model.micro_batch_size = args.train.micro_batch_size
+    for param in ref_model.parameters():
+        param.requires_grad = False
+    ref_model.eval()
+    ref_model.to(torch.bfloat16)
+
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
-    lora_target_modules_support = args.model.lora_target_modules_support.split(",")
+    lora_target_modules_support = ["q", "k", "v", "o", "ffn.0", "ffn.2"]
     if args.train.train_architecture == "lora":
         logger.info_rank0("train_architecture is lora")
         _use_orig_params = True
@@ -234,6 +278,18 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
         use_orig_params=_use_orig_params,
         ops_to_save=ops_to_save,
+    )
+    ref_model = build_parallelize_model(
+        ref_model,
+        weights_path=args.model.model_path,
+        enable_full_shard=True,
+        enable_mixed_precision=True,
+        enable_gradient_checkpointing=False,
+        init_device="cpu" if args.train.ref_cpu_offload else args.train.init_device,
+        enable_fsdp_offload=args.train.ref_cpu_offload or args.train.enable_fsdp_offload,
+        basic_modules=ref_model._no_split_modules,
+        use_orig_params=False,
+        param_dtype="bfloat16",
     )
 
     optimizer = build_optimizer(
@@ -330,6 +386,7 @@ def main():
     )
 
     flow_scheduler.set_timesteps(1000, training=True)
+    ref_infer_ctx = torch.inference_mode() if args.train.ref_inference_mode else torch.no_grad()
 
     for epoch in range(start_epoch, args.train.num_train_epochs):
         if hasattr(train_dataloader, "set_epoch"):
@@ -351,6 +408,11 @@ def main():
             synchronize()
             total_loss = 0
             start_time = time.time()
+
+            total_rewards_acc = 0
+            total_rewards_margin = 0
+            total_samples = 0
+
             try:
                 micro_batches: List[Dict[str, Any]] = next(data_iterator)
             except StopIteration:
@@ -359,8 +421,11 @@ def main():
 
             for micro_batch in micro_batches:
                 environ_meter.add(micro_batch, model_type="wan")
-                latents = micro_batch["latents"].to(model.device)
+
+                chosen_latents = micro_batch["latents"].to(model.device)
+                rejected_latents = micro_batch["latents_reject"].to(model.device)
                 prompt_emb = micro_batch["prompt_emb"]
+
                 if args.train.micro_batch_size > 1:
                     prompt_emb["context"] = prompt_emb["context"].squeeze(1).to(model.device)
                     image_emb = micro_batch["image_emb"]
@@ -376,31 +441,86 @@ def main():
                     if "y" in image_emb:
                         image_emb["y"] = image_emb["y"][0].to(model.device)
 
-                noise = torch.randn_like(latents)
-                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (latents.size(0),))
-                timestep = flow_scheduler.timesteps[timestep_id].to(latents.dtype).to(latents.device)
+                noise = torch.randn_like(chosen_latents)
+                timestep_id = torch.randint(0, flow_scheduler.num_train_timesteps, (chosen_latents.size(0),))
+                timestep = flow_scheduler.timesteps[timestep_id].to(chosen_latents.dtype).to(chosen_latents.device)
+                weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
+
                 # noise and target
-                noisy_latents = flow_scheduler.add_noise(
-                    latents,
+                noisy_chosen_latents = flow_scheduler.add_noise(
+                    chosen_latents,
                     noise,
                     timestep,
                     args.train.micro_batch_size,
                     args.train.enable_mixed_precision,
                 )
-                training_target = flow_scheduler.training_target(latents, noise, timestep)
+                training_target_chosen = flow_scheduler.training_target(chosen_latents, noise, timestep)
+                # training_target_chosen = training_target_chosen.to(
+                #     device=chosen_latents.device, dtype=chosen_latents.dtype, non_blocking=True
+                # )
+
+                noisy_rejected_latents = flow_scheduler.add_noise(
+                    rejected_latents,
+                    noise,
+                    timestep,
+                    args.train.micro_batch_size,
+                    args.train.enable_mixed_precision,
+                )
+                training_target_rejected = flow_scheduler.training_target(rejected_latents, noise, timestep)
+                training_target_rejected = training_target_rejected.to(
+                    device=rejected_latents.device, dtype=rejected_latents.dtype, non_blocking=True
+                )
+                del noise
+
                 # predict noise
                 with model_fwd_context:
-                    noise_pred = model.forward(
-                        noisy_latents,
+                    noise_pred_chosen_policy = model.forward(
+                        noisy_chosen_latents,
                         timestep=timestep,
                         **prompt_emb,
                         **image_emb,
                     )
-                    # MSE loss with weights
-                    loss = F.mse_loss(noise_pred.float(), training_target.float(), reduction="none")
-                    weight = flow_scheduler.training_weight(timestep, args.train.micro_batch_size)
-                    # shape: [B, ...], weight: [B]
-                    loss = (loss.view(latents.size(0), -1).mean(dim=1) * weight).mean() / len(micro_batches)
+                    loss_chosen_policy = caculate_mse_loss(noise_pred_chosen_policy, training_target_chosen, weight)
+
+                    noise_pred_rejected_policy = model.forward(
+                        noisy_rejected_latents,
+                        timestep=timestep,
+                        **prompt_emb,
+                        **image_emb,
+                    )
+                    loss_rejected_policy = caculate_mse_loss(
+                        noise_pred_rejected_policy, training_target_rejected, weight
+                    )
+                    del noise_pred_chosen_policy, noise_pred_rejected_policy
+
+                    with ref_infer_ctx:
+                        noise_pred_chosen_ref = ref_model.forward(
+                            noisy_chosen_latents, timestep=timestep, **prompt_emb, **image_emb
+                        )
+                        loss_chosen_ref = caculate_mse_loss(noise_pred_chosen_ref, training_target_chosen, weight)
+
+                        noise_pred_rejected_ref = ref_model.forward(
+                            noisy_rejected_latents, timestep=timestep, **prompt_emb, **image_emb
+                        )
+                        loss_rejected_ref = caculate_mse_loss(
+                            noise_pred_rejected_ref, training_target_rejected, weight
+                        )
+                        del noise_pred_chosen_ref, noise_pred_rejected_ref
+
+                    del prompt_emb, image_emb, noisy_chosen_latents, training_target_chosen
+                    del noisy_rejected_latents, training_target_rejected
+
+                    diff_policy = loss_chosen_policy - loss_rejected_policy  # [B]
+                    diff_ref = loss_chosen_ref - loss_rejected_ref  # [B]
+
+                    rewards_margin = 0.5 * args.train.dpo_beta * (diff_ref - diff_policy)  # [B]
+
+                    total_rewards_acc += (rewards_margin > 0).sum().item()
+                    total_rewards_margin += rewards_margin.sum().item()
+                    total_samples += rewards_margin.size(0)
+
+                    dpo_loss_per_sample = -F.logsigmoid(rewards_margin)  # [B]
+                    loss = dpo_loss_per_sample.mean() / len(micro_batches) + args.train.rpo_alpha * loss_chosen_policy
 
                 with model_bwd_context:
                     loss.backward()
@@ -416,7 +536,13 @@ def main():
             if hasattr(grad_norm, "full_tensor"):
                 grad_norm = grad_norm.full_tensor().item()
 
-            total_loss, grad_norm = all_reduce((total_loss, grad_norm), group=get_parallel_state().fsdp_group)
+            avg_rewards_acc = total_rewards_acc / total_samples if total_samples > 0 else 0.0
+            avg_rewards_margin = total_rewards_margin / total_samples if total_samples > 0 else 0.0
+
+            total_loss, grad_norm, avg_rewards_acc, avg_rewards_margin = all_reduce(
+                (total_loss, grad_norm, avg_rewards_acc, avg_rewards_margin), group=get_parallel_state().fsdp_group
+            )
+
             epoch_loss += total_loss
             synchronize()
             delta_time = time.time() - start_time
@@ -424,15 +550,21 @@ def main():
             train_metrics = environ_meter.step(delta_time, global_step=global_step)
 
             data_loader_tqdm.set_postfix_str(
-                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.2f}, lr: {lr:.2e}, step_time: {delta_time:.2f}s",
-                refresh=False,
+                f"loss: {total_loss:.4f}, grad_norm: {grad_norm:.6f}, lr: {lr:.2e}, "
+                f"rewards_acc: {avg_rewards_acc:.4f}, rewards_margin: {avg_rewards_margin:.4f}, step_time: {delta_time:.2f}s"
             )
             data_loader_tqdm.update()
 
             if args.train.global_rank == 0:
                 if args.train.use_wandb:
                     train_metrics.update(
-                        {"training/loss": total_loss, "training/grad_norm": grad_norm, "training/lr": lr}
+                        {
+                            "training/loss": total_loss,
+                            "training/grad_norm": grad_norm,
+                            "training/lr": lr,
+                            "training/rewards_acc": avg_rewards_acc,
+                            "training/rewards_margin": avg_rewards_margin,
+                        }
                     )
                     wandb.log(train_metrics, step=global_step)
 

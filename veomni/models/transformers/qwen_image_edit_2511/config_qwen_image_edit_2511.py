@@ -42,6 +42,8 @@ class QwenImageEdit2511Config(PretrainedConfig):
         num_layers=60,
         out_channels=16,
         patch_size=2,
+        use_additional_t_cond=False,
+        use_layer3d_rope=False,
         zero_cond_t=True,
         pooled_projection_dim=768,
         **kwargs,
@@ -55,6 +57,8 @@ class QwenImageEdit2511Config(PretrainedConfig):
         self.num_layers = num_layers
         self.out_channels = out_channels
         self.patch_size = patch_size
+        self.use_additional_t_cond = use_additional_t_cond
+        self.use_layer3d_rope = use_layer3d_rope
         self.zero_cond_t = zero_cond_t
         self.pooled_projection_dim = pooled_projection_dim
 
@@ -78,6 +82,8 @@ class QwenImageEdit2511Config(PretrainedConfig):
             "num_layers": self.num_layers,
             "out_channels": self.out_channels,
             "patch_size": self.patch_size,
+            "use_additional_t_cond": self.use_additional_t_cond,
+            "use_layer3d_rope": self.use_layer3d_rope,
             "zero_cond_t": self.zero_cond_t,
             "model_type": "qwen_image_edit_2511",
         }

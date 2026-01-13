@@ -1,29 +1,30 @@
 model:
-  model_path: /data/models/Qwen-Image-Edit-2511/transformer
-  config_path: ./configs/model_configs/qwen/Qwen-Image-Edit-2511.json
+  model_path: /data/models/Wan2.1-I2V-14B-720P
+  config_path: ./configs/model_configs/wan/wani2v_14b.json
   attn_implementation: flash_attention_2
-  lora_target_modules: to_q,to_k,to_v,add_q_proj,add_k_proj,add_v_proj,to_out.0,to_add_out,img_mlp.net.2,img_mod.1,txt_mlp.net.2,txt_mod.1
-  lora_target_modules_support: to_q,to_k,to_v,add_q_proj,add_k_proj,add_v_proj,to_out.0,to_add_out,img_mlp.net.2,img_mod.1,txt_mlp.net.2,txt_mod.1
+  lora_target_modules: q,k,v,o,ffn.0,ffn.2
+  lora_target_modules_support: q,k,v,o,ffn.0,ffn.2
   lora_rank: 128
   lora_alpha: 128
 
 data:
-  train_path: /data/ckpt_zsqiao/codes/Qwen-Image-LoRA-splited-cache
+  train_path: /data/ckpt_zsqiao/codes/shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4
   train_size: 1000000000000
   dataloader_type: native
   datasets_type: iterable
   data_type: diffusion
   text_keys: text
   drop_last: true
-  datasets_repeat: 16
+  datasets_repeat: 1
 
 train:
-  output_dir: /data/ckpt_zsqiao/sft_lora_bayinhe_image_edit_v1
+  output_dir: /data/ckpt_zsqiao/sft_lora_shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4_2026exp
   train_architecture: lora
+  dpo_beta: 5000
   data_parallel_mode: fsdp1
   data_parallel_replicate_size: 1
   ulysses_parallel_size: 1
-  global_batch_size: 8
+  global_batch_size: 16
   micro_batch_size: 1
   rmpad: false
   rmpad_with_pos_ids: false
@@ -38,7 +39,7 @@ train:
   lr_decay_ratio: 1.0
   weight_decay: 0.01
   max_grad_norm: 1.0
-  enable_mixed_precision: false
+  enable_mixed_precision: true
   enable_gradient_checkpointing: true
   enable_full_shard: true
   enable_fsdp_offload: false
@@ -49,12 +50,12 @@ train:
   ckpt_manager: dcp
   load_checkpoint_path: ""
   max_steps: 1000
-  save_epochs: 5
-  num_train_epochs: 5
+  save_epochs: 2
+  num_train_epochs: 40
   save_hf_weights: true
   use_wandb: false
-  wandb_project: SFT-LoRA-Qwen-Image-Edit-2511
-  wandb_name: sft_lora_qwen_image_edit_2511
+  wandb_project: DPO-LoRA-Wan2.1-I2V-14B-720P
+  wandb_name: dpo_lora_wan2_1_i2v_14b_720p
   ops_to_save:
     # - aten.addmm.default
     - torch.ops.flash_attn._flash_attn_forward.default

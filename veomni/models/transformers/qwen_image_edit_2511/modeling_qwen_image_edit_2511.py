@@ -1,14 +1,27 @@
+import functools
 import math
-from typing import Optional, Tuple, Union
+from math import prod
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
 from torch import nn
 from transformers import PreTrainedModel
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from veomni.models.transformers.flux.modeling_flux import AdaLayerNorm
 from veomni.models.transformers.qwen_image_edit_2511.config_qwen_image_edit_2511 import QwenImageEdit2511Config
 
+from ....utils import logging
+from ....utils.import_utils import (
+    is_liger_kernel_available,
+)
+
+
+if is_liger_kernel_available():
+    from liger_kernel.transformers.rms_norm import LigerRMSNorm
+
+
+logger = logging.get_logger(__name__)
 
 try:
     import flash_attn_interface
@@ -16,13 +29,6 @@ try:
     FLASH_ATTN_3_AVAILABLE = True
 except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
-
-try:
-    from flash_attn import flash_attn_func
-
-    FLASH_ATTN_2_AVAILABLE = True
-except ModuleNotFoundError:
-    FLASH_ATTN_2_AVAILABLE = False
 
 
 def get_timestep_embedding(
@@ -35,13 +41,6 @@ def get_timestep_embedding(
     computation_device=None,
     align_dtype_to_timestep=False,
 ):
-    """
-    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
-    :param timesteps: a 1-D Tensor of N indices, one per batch element.
-                      These may be fractional.
-    :param embedding_dim: the dimension of the output. :param max_period: controls the minimum frequency of the
-    embeddings. :return: an [N x dim] Tensor of positional embeddings.
-    """
     assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
 
     half_dim = embedding_dim // 2
@@ -53,7 +52,7 @@ def get_timestep_embedding(
     )
     exponent = exponent / (half_dim - downscale_freq_shift)
 
-    emb = torch.exp(exponent).to(timesteps.device)
+    emb = torch.exp(exponent)
     if align_dtype_to_timestep:
         emb = emb.to(timesteps.dtype)
     emb = timesteps[:, None].float() * emb[None, :]
@@ -119,6 +118,34 @@ def qwen_image_flash_attention(
     return x
 
 
+class AdaLayerNorm(torch.nn.Module):
+    def __init__(self, dim, single=False, dual=False):
+        super().__init__()
+        self.single = single
+        self.dual = dual
+        self.linear = torch.nn.Linear(dim, dim * [[6, 2][single], 9][dual])
+        self.norm = torch.nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+
+    def forward(self, x, emb):
+        emb = self.linear(torch.nn.functional.silu(emb))
+        if self.single:
+            scale, shift = emb.unsqueeze(1).chunk(2, dim=2)
+            x = self.norm(x) * (1 + scale) + shift
+            return x
+        elif self.dual:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2, gate_msa2 = (
+                emb.unsqueeze(1).chunk(9, dim=2)
+            )
+            norm_x = self.norm(x)
+            x = norm_x * (1 + scale_msa) + shift_msa
+            norm_x2 = norm_x * (1 + scale_msa2) + shift_msa2
+            return x, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_x2, gate_msa2
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.unsqueeze(1).chunk(6, dim=2)
+            x = self.norm(x) * (1 + scale_msa) + shift_msa
+            return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
 class QwenEmbedRope(nn.Module):
     def __init__(self, theta: int, axes_dim: list[int], scale_rope=False):
         super().__init__()
@@ -146,10 +173,6 @@ class QwenEmbedRope(nn.Module):
         self.scale_rope = scale_rope
 
     def rope_params(self, index, dim, theta=10000):
-        """
-        Args:
-            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
-        """
         assert dim % 2 == 0
         freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
         freqs = torch.polar(torch.ones_like(freqs), freqs)
@@ -157,7 +180,7 @@ class QwenEmbedRope(nn.Module):
 
     def _expand_pos_freqs_if_needed(self, video_fhw, txt_seq_lens):
         if isinstance(video_fhw, list):
-            video_fhw = video_fhw[0]
+            video_fhw = tuple(max([i[j] for i in video_fhw]) for j in range(3))
         _, height, width = video_fhw
         if self.scale_rope:
             max_vid_index = max(height // 2, width // 2)
@@ -187,7 +210,6 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-        return
 
     def forward(self, video_fhw, txt_seq_lens, device):
         self._expand_pos_freqs_if_needed(video_fhw, txt_seq_lens)
@@ -213,7 +235,6 @@ class QwenEmbedRope(nn.Module):
                     freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
                     freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
                     freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-
                 else:
                     freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
                     freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
@@ -272,7 +293,6 @@ class QwenEmbedRope(nn.Module):
                     freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
                     freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
                     freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
-
                 else:
                     freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
                     freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
@@ -291,6 +311,121 @@ class QwenEmbedRope(nn.Module):
         vid_freqs = torch.cat(vid_freqs, dim=0)
 
         return vid_freqs, txt_freqs
+
+
+class QwenEmbedLayer3DRope(nn.Module):
+    def __init__(self, theta: int, axes_dim: List[int], scale_rope=False):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+        pos_index = torch.arange(4096)
+        neg_index = torch.arange(4096).flip(0) * -1 - 1
+        self.pos_freqs = torch.cat(
+            [
+                self.rope_params(pos_index, self.axes_dim[0], self.theta),
+                self.rope_params(pos_index, self.axes_dim[1], self.theta),
+                self.rope_params(pos_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+        self.neg_freqs = torch.cat(
+            [
+                self.rope_params(neg_index, self.axes_dim[0], self.theta),
+                self.rope_params(neg_index, self.axes_dim[1], self.theta),
+                self.rope_params(neg_index, self.axes_dim[2], self.theta),
+            ],
+            dim=1,
+        )
+
+        self.scale_rope = scale_rope
+
+    def rope_params(self, index, dim, theta=10000):
+        """
+        Args:
+            index: [0, 1, 2, 3] 1D Tensor representing the position index of the token
+        """
+        assert dim % 2 == 0
+        freqs = torch.outer(index, 1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float32).div(dim)))
+        freqs = torch.polar(torch.ones_like(freqs), freqs)
+        return freqs
+
+    def forward(self, video_fhw, txt_seq_lens, device):
+        """
+        Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
+        txt_length: [bs] a list of 1 integers representing the length of the text
+        """
+        if self.pos_freqs.device != device:
+            self.pos_freqs = self.pos_freqs.to(device)
+            self.neg_freqs = self.neg_freqs.to(device)
+
+        video_fhw = [video_fhw]
+        if isinstance(video_fhw, list):
+            video_fhw = video_fhw[0]
+        if not isinstance(video_fhw, list):
+            video_fhw = [video_fhw]
+
+        vid_freqs = []
+        max_vid_index = 0
+        layer_num = len(video_fhw) - 1
+        for idx, fhw in enumerate(video_fhw):
+            frame, height, width = fhw
+            if idx != layer_num:
+                video_freq = self._compute_video_freqs(frame, height, width, idx)
+            else:
+                ### For the condition image, we set the layer index to -1
+                video_freq = self._compute_condition_freqs(frame, height, width)
+            video_freq = video_freq.to(device)
+            vid_freqs.append(video_freq)
+
+            if self.scale_rope:
+                max_vid_index = max(height // 2, width // 2, max_vid_index)
+            else:
+                max_vid_index = max(height, width, max_vid_index)
+
+        max_vid_index = max(max_vid_index, layer_num)
+        max_len = max(txt_seq_lens)
+        txt_freqs = self.pos_freqs[max_vid_index : max_vid_index + max_len, ...]
+        vid_freqs = torch.cat(vid_freqs, dim=0)
+
+        return vid_freqs, txt_freqs
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_video_freqs(self, frame, height, width, idx=0):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = freqs_pos[0][idx : idx + frame].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+        if self.scale_rope:
+            freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+        else:
+            freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+        return freqs.clone().contiguous()
+
+    @functools.lru_cache(maxsize=None)
+    def _compute_condition_freqs(self, frame, height, width):
+        seq_lens = frame * height * width
+        freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+        freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
+
+        freqs_frame = freqs_neg[0][-1:].view(frame, 1, 1, -1).expand(frame, height, width, -1)
+        if self.scale_rope:
+            freqs_height = torch.cat([freqs_neg[1][-(height - height // 2) :], freqs_pos[1][: height // 2]], dim=0)
+            freqs_height = freqs_height.view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = torch.cat([freqs_neg[2][-(width - width // 2) :], freqs_pos[2][: width // 2]], dim=0)
+            freqs_width = freqs_width.view(1, 1, width, -1).expand(frame, height, width, -1)
+        else:
+            freqs_height = freqs_pos[1][:height].view(1, height, 1, -1).expand(frame, height, width, -1)
+            freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
+
+        freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
+        return freqs.clone().contiguous()
 
 
 class TemporalTimesteps(torch.nn.Module):
@@ -347,6 +482,7 @@ class TimestepEmbeddings(torch.nn.Module):
         diffusers_compatible_format=False,
         scale=1,
         align_dtype_to_timestep=False,
+        use_additional_t_cond=False,
     ):
         super().__init__()
         self.time_proj = TemporalTimesteps(
@@ -363,10 +499,17 @@ class TimestepEmbeddings(torch.nn.Module):
             self.timestep_embedder = torch.nn.Sequential(
                 torch.nn.Linear(dim_in, dim_out), torch.nn.SiLU(), torch.nn.Linear(dim_out, dim_out)
             )
+        self.use_additional_t_cond = use_additional_t_cond
+        if use_additional_t_cond:
+            self.addition_t_embedding = torch.nn.Embedding(2, dim_out)
 
-    def forward(self, timestep, dtype):
+    def forward(self, timestep, dtype, addition_t_cond=None):
         time_emb = self.time_proj(timestep).to(dtype)
         time_emb = self.timestep_embedder(time_emb)
+        if addition_t_cond is not None:
+            addition_t_emb = self.addition_t_embedding(addition_t_cond)
+            addition_t_emb = addition_t_emb.to(dtype=dtype)
+            time_emb = time_emb + addition_t_emb
         return time_emb
 
 
@@ -534,9 +677,38 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = QwenFeedForward(dim=dim, dim_out=dim)
 
-    def _modulate(self, x, mod_params):
+    def _modulate(self, x, mod_params, index=None):
         shift, scale, gate = mod_params.chunk(3, dim=-1)
-        return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
+        if index is not None:
+            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
+            # So shift, scale, gate have shape [2*actual_batch, d]
+            actual_batch = shift.size(0) // 2
+            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
+            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
+            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
+
+            # index: [b, l] where b is actual batch size
+            # Expand to [b, l, 1] to match feature dimension
+            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
+
+            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
+            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
+            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
+            scale_0_exp = scale_0.unsqueeze(1)
+            scale_1_exp = scale_1.unsqueeze(1)
+            gate_0_exp = gate_0.unsqueeze(1)
+            gate_1_exp = gate_1.unsqueeze(1)
+
+            # Use torch.where to select based on index
+            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
+            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
+            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
+        else:
+            shift_result = shift.unsqueeze(1)
+            scale_result = scale.unsqueeze(1)
+            gate_result = gate.unsqueeze(1)
+
+        return x * (1 + scale_result) + shift_result, gate_result
 
     def forward(
         self,
@@ -546,12 +718,15 @@ class QwenImageTransformerBlock(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         enable_fp8_attention=False,
+        modulate_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
+        if modulate_index is not None:
+            temb = torch.chunk(temb, 2, dim=0)[0]
         txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
 
         img_normed = self.img_norm1(image)
-        img_modulated, img_gate = self._modulate(img_normed, img_mod_attn)
+        img_modulated, img_gate = self._modulate(img_normed, img_mod_attn, index=modulate_index)
 
         txt_normed = self.txt_norm1(text)
         txt_modulated, txt_gate = self._modulate(txt_normed, txt_mod_attn)
@@ -568,7 +743,7 @@ class QwenImageTransformerBlock(nn.Module):
         text = text + txt_gate * txt_attn_out
 
         img_normed_2 = self.img_norm2(image)
-        img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp)
+        img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp, index=modulate_index)
 
         txt_normed_2 = self.txt_norm2(text)
         txt_modulated_2, txt_gate_2 = self._modulate(txt_normed_2, txt_mod_mlp)
@@ -587,18 +762,24 @@ class QwenImageEdit2511Model(PreTrainedModel):
     supports_gradient_checkpointing = True
     _supports_flash_attn_2 = True
     _supports_flash_attn_3 = True
-
-    # TODO
     _no_split_modules = ["QwenImageTransformerBlock"]
 
     def __init__(self, config: QwenImageEdit2511Config, **kwargs):
         super().__init__(config, **kwargs)
-
         self.num_layers = config.num_layers
-        self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+
+        if not config.use_layer3d_rope:
+            self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+        else:
+            self.pos_embed = QwenEmbedLayer3DRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
 
         self.time_text_embed = TimestepEmbeddings(
-            256, 3072, diffusers_compatible_format=True, scale=1000, align_dtype_to_timestep=True
+            256,
+            3072,
+            diffusers_compatible_format=True,
+            scale=1000,
+            align_dtype_to_timestep=False,
+            use_additional_t_cond=config.use_additional_t_cond,
         )
         self.txt_norm = RMSNorm(3584, eps=1e-6)
 
@@ -618,6 +799,8 @@ class QwenImageEdit2511Model(PreTrainedModel):
         self.norm_out = AdaLayerNorm(3072, single=True)
         self.proj_out = nn.Linear(3072, 64)
 
+        self.gradient_checkpointing = False
+
     def forward(
         self,
         latents=None,
@@ -626,31 +809,85 @@ class QwenImageEdit2511Model(PreTrainedModel):
         prompt_emb_mask=None,
         height=None,
         width=None,
+        edit_latents=None,
+        edit_rope_interpolation=False,
+        zero_cond_t=True,
     ):
-        img_shapes = [(latents.shape[0], latents.shape[2] // 2, latents.shape[3] // 2)]
-        txt_seq_lens = prompt_emb_mask.sum(dim=1).tolist()
+        token_h, token_w = latents.shape[2] // 2, latents.shape[3] // 2
+        img_shapes = [(1, token_h, token_w)]
+        txt_seq_lens = prompt_emb_mask.sum(dim=-1).tolist()
+        timestep = timestep / 1000
 
-        image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height // 16, W=width // 16, P=2, Q=2)
+        image = rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=token_h, W=token_w, P=2, Q=2)
+        image_seq_len = image.shape[1]
+
+        edit_latents_list = edit_latents if isinstance(edit_latents, list) else [edit_latents]
+        for e in edit_latents_list:
+            e_token_h, e_token_w = e.shape[2] // 2, e.shape[3] // 2
+            img_shapes.append((e.shape[0], e_token_h, e_token_w))
+        edit_image = [
+            rearrange(e, "B C (H P) (W Q) -> B (H W) (C P Q)", H=e.shape[2] // 2, W=e.shape[3] // 2, P=2, Q=2)
+            for e in edit_latents_list
+        ]
+        image = torch.cat([image] + edit_image, dim=1)
+
         image = self.img_in(image)
+        if zero_cond_t:
+            timestep = torch.cat([timestep, timestep * 0], dim=0)
+            modulate_index = torch.tensor(
+                [[0] * prod(img_shapes[0]) + [1] * sum([prod(s) for s in img_shapes[1:]])],
+                device=latents.device,
+                dtype=torch.int,
+            )
+        else:
+            modulate_index = None
+
+        conditioning = self.time_text_embed(
+            timestep,
+            image.dtype,
+            addition_t_cond=None
+            if not self.time_text_embed.use_additional_t_cond
+            else torch.tensor([0]).to(device=image.device, dtype=torch.long),
+        )
+
         text = self.txt_in(self.txt_norm(prompt_emb))
-
-        conditioning = self.time_text_embed(timestep, image.dtype)
-
-        image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=latents.device)
+        if edit_rope_interpolation:
+            image_rotary_emb = self.pos_embed.forward_sampling(img_shapes, txt_seq_lens, device=latents.device)
+        else:
+            image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=latents.device)
 
         for block in self.transformer_blocks:
-            text, image = block(
-                image=image,
-                text=text,
-                temb=conditioning,
-                image_rotary_emb=image_rotary_emb,
-            )
+            if self.training and self.gradient_checkpointing:
+                text, image = self._gradient_checkpointing_func(
+                    block.__call__,
+                    image,
+                    text,
+                    conditioning,
+                    image_rotary_emb,
+                    None,  # attention_mask
+                    False,  # enable_fp8_attention
+                    modulate_index,
+                )
+            else:
+                text, image = block(
+                    image=image,
+                    text=text,
+                    temb=conditioning,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_mask=None,
+                    enable_fp8_attention=False,
+                    modulate_index=modulate_index,
+                )
+
+        if zero_cond_t:
+            conditioning = conditioning.chunk(2, dim=0)[0]
 
         image = self.norm_out(image, conditioning)
         image = self.proj_out(image)
+        image = image[:, :image_seq_len]
 
-        latents = rearrange(image, "B (H W) (C P Q) -> B C (H P) (W Q)", H=height // 16, W=width // 16, P=2, Q=2)
-        return image
+        latents_out = rearrange(image, "B (H W) (C P Q) -> B C (H P) (W Q)", H=token_h, W=token_w, P=2, Q=2)
+        return latents_out
 
     @staticmethod
     def state_dict_converter():
@@ -664,5 +901,27 @@ class QwenImageDiTStateDictConverter:
     def from_civitai(self, state_dict):
         return state_dict
 
+
+if is_liger_kernel_available():
+    RMSNorm = LigerRMSNorm
+    logger.info_rank0("Apply liger kernel to QwenImageEdit2511.")
+
+# try:
+#     from veomni.ops.dit.rope_wan.rotary import apply_rotary_emb
+
+#     rope_apply = apply_rotary_emb
+#     logger.info_rank0("Apply fused interleaved rope to QwenImageEdit2511.")
+# except ImportError:
+#     pass
+
+# WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
+# WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)
+# WAN_ATTENTION_FUNCTIONS.update(
+#     {
+#         "eager": eager_attention_forward,
+#         "flash_attention_3": wrapped_flash_attention_3,
+#         "sageattention": wrapped_sageattention,
+#     }
+# )
 
 ModelClass = QwenImageEdit2511Model
