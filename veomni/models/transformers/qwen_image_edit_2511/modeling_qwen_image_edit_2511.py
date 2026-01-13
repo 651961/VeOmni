@@ -31,6 +31,15 @@ except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 
+try:
+    from flash_attn import flash_attn_func
+
+    FLASH_ATTN_2_AVAILABLE = True
+    logger.info("Flash Attention 2 available.")
+except ImportError:
+    FLASH_ATTN_2_AVAILABLE = False
+
+
 def get_timestep_embedding(
     timesteps: torch.Tensor,
     embedding_dim: int,
@@ -112,6 +121,12 @@ def qwen_image_flash_attention(
                 x = x[0]
             x = x.to(origin_dtype) * v_std
             x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
+    elif FLASH_ATTN_2_AVAILABLE and attention_mask is None and not enable_fp8_attention:
+        q = rearrange(q, "b n s d -> b s n d", n=num_heads)
+        k = rearrange(k, "b n s d -> b s n d", n=num_heads)
+        v = rearrange(v, "b n s d -> b s n d", n=num_heads)
+        x = flash_attn_func(q, k, v, causal=False)
+        x = rearrange(x, "b s n d -> b s (n d)", n=num_heads)
     else:
         x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask)
         x = rearrange(x, "b n s d -> b s (n d)", n=num_heads)
