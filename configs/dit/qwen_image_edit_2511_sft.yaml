@@ -1,0 +1,58 @@
+model:
+  model_path: /data/models/Qwen-Image-Edit-2511/transformer
+  config_path: ./configs/model_configs/qwen/Qwen-Image-Edit-2511.json
+  attn_implementation: flash_attention_2
+
+data:
+  train_path: /data/ckpt_zsqiao/codes/Qwen-Image-LoRA-splited-cache
+  train_size: 1000000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: diffusion
+  text_keys: text
+  drop_last: true
+  datasets_repeat: 16
+
+train:
+  output_dir: /data/ckpt_zsqiao/sft_full_bayinhe_image_edit_v1
+  train_architecture: full
+  data_parallel_mode: fsdp1
+  data_parallel_replicate_size: 1
+  ulysses_parallel_size: 1
+  global_batch_size: 8
+  micro_batch_size: 1
+  rmpad: false
+  rmpad_with_pos_ids: false
+  bsz_warmup_ratio: 0.007
+  dyn_bsz_margin: 0
+  dyn_bsz_buffer_size: 200
+  seed: 42
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.005
+  lr_decay_style: constant
+  lr_decay_ratio: 1.0
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: false
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda
+  enable_full_determinism: false
+  empty_cache_steps: 500
+  ckpt_manager: dcp
+  load_checkpoint_path: ""
+  max_steps: 1000
+  save_epochs: 5
+  num_train_epochs: 5
+  save_hf_weights: true
+  use_wandb: false
+  wandb_project: SFT-Qwen-Image-Edit-2511
+  wandb_name: sft_qwen_image_edit_2511
+  ops_to_save:
+    # - aten.addmm.default
+    - torch.ops.flash_attn._flash_attn_forward.default
+    - aten._scaled_dot_product_flash_attention.default
+    - torch.ops.flash_attn_3.fwd.default
