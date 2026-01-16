@@ -8,7 +8,7 @@ model:
   lora_alpha: 128
 
 data:
-  train_path: /data/ckpt_zsqiao/codes/shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4
+  train_path: /data/ckpt_zsqiao/codes/3D_meiman_v1
   train_size: 1000000000000
   dataloader_type: native
   datasets_type: iterable
@@ -18,7 +18,7 @@ data:
   datasets_repeat: 1
 
 train:
-  output_dir: /data/ckpt_zsqiao/sft_lora_shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4_2026exp
+  output_dir: /data/ckpt_zsqiao/sft_lora_3D_meiman_v1
   train_architecture: lora
   data_parallel_mode: fsdp1
   data_parallel_replicate_size: 1
