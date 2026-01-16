@@ -1,13 +1,12 @@
 import functools
 import math
 from math import prod
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
 from torch import nn
 from transformers import PreTrainedModel
-from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from veomni.models.transformers.qwen_image_edit_2511.config_qwen_image_edit_2511 import QwenImageEdit2511Config
 
@@ -921,22 +920,5 @@ if is_liger_kernel_available():
     RMSNorm = LigerRMSNorm
     logger.info_rank0("Apply liger kernel to QwenImageEdit2511.")
 
-# try:
-#     from veomni.ops.dit.rope_wan.rotary import apply_rotary_emb
-
-#     rope_apply = apply_rotary_emb
-#     logger.info_rank0("Apply fused interleaved rope to QwenImageEdit2511.")
-# except ImportError:
-#     pass
-
-# WAN_ATTENTION_FUNCTIONS: Dict[str, Dict[str, Callable]] = {}
-# WAN_ATTENTION_FUNCTIONS.update(ALL_ATTENTION_FUNCTIONS)
-# WAN_ATTENTION_FUNCTIONS.update(
-#     {
-#         "eager": eager_attention_forward,
-#         "flash_attention_3": wrapped_flash_attention_3,
-#         "sageattention": wrapped_sageattention,
-#     }
-# )
 
 ModelClass = QwenImageEdit2511Model
