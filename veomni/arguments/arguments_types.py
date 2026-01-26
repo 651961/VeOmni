@@ -364,6 +364,14 @@ class TrainingArguments:
         default=False,
         metadata={"help": "Enable padding-free training by using the position_ids."},
     )
+    pad_packed_to_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Pad packed sequences to a fixed length when rmpad_with_pos_ids is enabled."},
+    )
+    pad_packed_input: bool = field(
+        default=False,
+        metadata={"help": "Enable padding for packed sequences when rmpad_with_pos_ids is enabled."},
+    )
     dyn_bsz: bool = field(
         default=True,
         metadata={"help": "Enable dynamic batch size for padding-free training."},
@@ -399,6 +407,14 @@ class TrainingArguments:
     lr_decay_ratio: float = field(
         default=1.0,
         metadata={"help": "Ratio of learning rate decay steps."},
+    )
+    enable_reshard_after_forward: bool = field(
+        default=True,
+        metadata={"help": "Enable reshard after forward for FSDP2."},
+    )
+    enable_reshard_after_backward: bool = field(
+        default=True,
+        metadata={"help": "Enable reshard after backward for  FSDP2."},
     )
     enable_mixed_precision: bool = field(
         default=True,
@@ -665,7 +681,7 @@ class TrainingArguments:
             raise ValueError("Gradient accumulation is not supported with FSDP offload.")
 
         # calculate dataloader batch size (for StreamingDataset and StreamingDataLoader)
-        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker":
+        if (self.rmpad or self.rmpad_with_pos_ids) and self.dyn_bsz_runtime == "worker" and self.dyn_bsz:
             self.dataloader_batch_size = 1
         else:
             self.dataloader_batch_size = self.global_batch_size // self.data_parallel_size  # = micro bsz * grad accu
@@ -705,11 +721,25 @@ class TrainingArguments:
         Computes the training steps per epoch according to the data length.
         """
         if self.rmpad or self.rmpad_with_pos_ids:
-            assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
-            token_micro_bsz = self.micro_batch_size * max_seq_len
-            train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
-            eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
-            self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
+            if self.dyn_bsz:
+                assert max_seq_len is not None and train_size is not None, "max_seq_len and train_size are required."
+                token_micro_bsz = self.micro_batch_size * max_seq_len
+                train_size = int(train_size * (1 + self.bsz_warmup_ratio / 2))
+                eff_token_rate = (token_micro_bsz - self.dyn_bsz_margin) / token_micro_bsz
+                self._train_steps = math.ceil(train_size / (self.global_batch_size * max_seq_len * eff_token_rate))
+            else:
+                if (
+                    dataset_length is not None
+                ):  # for dataset with __len__ attribute (e.g. mapping dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
+                    self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)
+                elif (
+                    self.max_steps is not None
+                ):  # for dataset without __len__ attribute (e.g. iterable dataset) when rmpad or rmpad_with_pos_ids without dyn_bsz
+                    self._train_steps = self.max_steps
+                else:
+                    raise ValueError(
+                        "For iterable dataset, please provide 'max_steps' or set dyn_bsz=True when removing padding."
+                    )
         elif dataset_length is not None:
             self._train_steps = math.floor(dataset_length / self.dataloader_batch_size)  # assuming drop_last is true
         elif self.max_steps is not None:
@@ -736,7 +766,19 @@ class VeOmniArguments:
     train: TrainingArguments = field(default_factory=TrainingArguments)
 
     def __post_init__(self):
-        pass
+        if self.train.pad_packed_input:
+            assert self.train.rmpad_with_pos_ids, "when using pad_packed_input, rmpad_with_pos_ids must be enabled."
+            if self.train.pad_packed_to_length is None and self.data.max_seq_len is not None:
+                self.train.pad_packed_to_length = self.train.micro_batch_size * self.data.max_seq_len
+                logger.info_rank0(
+                    f"pad_packed_input is set to true without pad_packed_to_length, setting pad_packed_to_length to train.micro_batch_size * data.max_seq_len = {self.train.pad_packed_to_length}"
+                )
+            if self.train.pad_packed_to_length < self.train.micro_batch_size * self.data.max_seq_len:
+                logger.warning_rank0(
+                    "pad_packed_to_length is smaller than train.micro_batch_size * data.max_seq_len, the actual input size can be larger than pad_packed_to_length"
+                )
+        else:
+            self.train.pad_packed_to_length = None
 
 
 # ================================ Infer Arguments ======================================

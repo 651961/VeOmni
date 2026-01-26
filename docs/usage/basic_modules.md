@@ -222,6 +222,7 @@ train_dataloader = build_dataloader(
     train_steps=args.train.train_steps, # train steps, calculate by args.train.compute_train_steps
     rmpad=args.train.rmpad, # remove padding
     rmpad_with_pos_ids=args.train.rmpad_with_pos_ids, # remove padding with position ids
+    dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
     bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
     bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
     dyn_bsz_margin=args.train.dyn_bsz_margin, # dynamic batching margin
@@ -276,6 +277,7 @@ model = build_foundation_model(...)
 model = build_parallelize_model(
     model,
     enable_full_shard=args.train.enable_full_shard, # enable full shard, same to Zero3
+    enable_reshard_after_forward=args.train.enable_reshard_after_forward, # enable reshard after forward for FSDP2
     enable_mixed_precision=args.train.enable_mixed_precision, # enable mixed precision
     enable_gradient_checkpointing=args.train.enable_gradient_checkpointing, # enable gradient checkpointing
     init_device=args.train.init_device, # model init device
