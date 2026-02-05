@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 import transformers.models.qwen3_moe.modeling_qwen3_moe as hf_qwen3_moe
 from torch import nn
-from transformers import Qwen3MoeConfig, Qwen3MoeModel
+from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3MoeModel
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
@@ -118,6 +118,8 @@ class PatchQwen3MoeExperts(nn.Module):
                 fc1_2_weight=self.up_proj,
                 fc2_weight=self.down_proj,
             )
+        else:
+            raise ValueError(f"Invalid moe implementation: {self._moe_implementation}")
 
         return final_hidden_states
 
@@ -160,9 +162,9 @@ class PatchQwen3MoeSparseMoeBlock(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
-        _, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
+        router_logits, routing_weights, selected_experts = self.gate(hidden_states_reshaped)
         final_hidden_states = self.experts(hidden_states_reshaped, selected_experts, routing_weights)
-        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states.reshape(batch_size, sequence_length, hidden_dim), router_logits
 
 
 # ================================================================
@@ -241,7 +243,7 @@ def qwen3_moe_model_forward(
 # 1. Support use with fuse cross_entropy loss function.
 # ================================================================
 def qwen3_moe_forcausal_lm_forward(
-    self,
+    self: Qwen3MoeForCausalLM,
     input_ids: Optional[torch.LongTensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.LongTensor] = None,
