@@ -20,7 +20,9 @@ data:
 train:
   output_dir: /data/ckpt_zsqiao/sft_lora_shuangren_dazhaohu_with_shouchiwu_dazhaohu_v4_2026exp
   train_architecture: lora
-  dpo_beta: 5000
+  dpo_beta: 5000.0
+  dpo_omega: 2.0
+  rpo_alpha: 0.1
   data_parallel_mode: fsdp1
   data_parallel_replicate_size: 1
   ulysses_parallel_size: 1
