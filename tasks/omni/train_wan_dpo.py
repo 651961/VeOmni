@@ -99,11 +99,15 @@ class MyTrainingArguments(TrainingArguments):
         default="full",
         metadata={"help": "Model structure to train. LoRA training or full training."},
     )
-    dpo_beta: int = field(
-        default=5000,
+    dpo_beta: float = field(
+        default=5000.0,
         metadata={"help": "DPO Beta"},
     )
-    rpo_alpha: int = field(
+    dpo_omega: float = field(
+        default=2.0,
+        metadata={"help": "DPO Omega"},
+    )
+    rpo_alpha: float = field(
         default=0.1,
         metadata={"help": "controls the weight of the SFT loss"},
     )
@@ -510,10 +514,13 @@ def main():
                     del prompt_emb, image_emb, noisy_chosen_latents, training_target_chosen
                     del noisy_rejected_latents, training_target_rejected
 
-                    diff_policy = loss_chosen_policy - loss_rejected_policy  # [B]
-                    diff_ref = loss_chosen_ref - loss_rejected_ref  # [B]
+                    # diff_policy = loss_chosen_policy - loss_rejected_policy  # [B]
+                    # diff_ref = loss_chosen_ref - loss_rejected_ref  # [B]
+                    diff_win = loss_chosen_policy - loss_chosen_ref  # [B]
+                    diff_lose = loss_rejected_policy - loss_rejected_ref  # [B]
 
-                    rewards_margin = 0.5 * args.train.dpo_beta * (diff_ref - diff_policy)  # [B]
+                    # rewards_margin = 0.5 * args.train.dpo_beta * (diff_ref - diff_policy)  # [B]
+                    rewards_margin = 0.5 * args.train.dpo_beta * (diff_lose - args.train.dpo_omega * diff_win)
 
                     total_rewards_acc += (rewards_margin > 0).sum().item()
                     total_rewards_margin += rewards_margin.sum().item()
