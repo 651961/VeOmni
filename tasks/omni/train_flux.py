@@ -160,8 +160,11 @@ def main():
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     dist.init_process_group(backend=get_dist_comm_backend())
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
 
     Checkpointer = build_checkpointer(
         dist_backend=args.train.data_parallel_mode,

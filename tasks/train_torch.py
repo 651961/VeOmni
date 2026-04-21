@@ -61,12 +61,17 @@ def main():
     logger.info_rank0(json.dumps(asdict(args), indent=2))
     get_torch_device().set_device(f"{get_device_type()}:{args.train.local_rank}")
     helper.set_seed(args.train.seed, args.train.enable_full_determinism)
+    helper.enable_high_precision_for_bf16()
     if args.train.local_rank == 0:
         helper.enable_third_party_logging()
 
     if args.train.global_rank == 0:
         save_args(args, args.train.output_dir)
 
+    # Gradient checkpointing debug
+    torch.utils.checkpoint.set_checkpoint_debug_enabled(args.train.debug_gradient_checkpointing)
+
+    # Model checkpointer
     Checkpointer = build_checkpointer(dist_backend=args.train.data_parallel_mode, ckpt_manager=args.train.ckpt_manager)
 
     init_parallel_state(
