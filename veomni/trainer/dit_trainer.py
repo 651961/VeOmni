@@ -379,6 +379,7 @@ class DiTTrainer:
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
                 prefetch_factor=args.data.dataloader.prefetch_factor,
+                shuffle=args.data.shuffle,
                 seed=args.train.seed,
                 collate_fn=DiTDataCollator(),
             )
@@ -415,7 +416,7 @@ class DiTTrainer:
 
         micro_batch = {k: _to_device(v) for k, v in micro_batch.items()}
         if getattr(self.base, "LOG_SAMPLE", True):
-            helper.print_example(example=micro_batch, rank=self.base.args.train.local_rank)
+            # helper.print_example(example=micro_batch, rank=self.base.args.train.local_rank)
             self.base.LOG_SAMPLE = False
         return micro_batch
 
@@ -424,7 +425,10 @@ class DiTTrainer:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """Postprocess model outputs after forward pass."""
         loss_dict: Dict[str, torch.Tensor] = outputs.loss
-        loss_dict = {k: v / self.base.args.train.micro_batch_size for k, v in loss_dict.items()}
+        loss_dict = {
+            k: v / (self.base.args.train.micro_batch_size * self.base.num_micro_batches)
+            for k, v in loss_dict.items()
+        }
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 

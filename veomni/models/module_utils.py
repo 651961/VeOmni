@@ -425,7 +425,7 @@ def rank0_load_and_broadcast_weights(
 
     def _broadcast_and_dispatch(name, shape, dtype, tensor):
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
-        logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
+        # logger.info_rank0(f"rank0_load_and_broadcast_weights: broadcasting {name=}")
         if global_rank != 0:
             tensor = torch.empty(shape, dtype=dtype, device=torch_device)
         else:
@@ -433,9 +433,9 @@ def rank0_load_and_broadcast_weights(
 
         start_time = time.perf_counter()
         dist.broadcast(tensor, src=0)
-        logger.info_rank0(
-            f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
-        )
+        # logger.info_rank0(
+        #     f"{name=}, {shape=}, {dtype=}, broadcast time (ms) spent: {1000 * (time.perf_counter() - start_time)}"
+        # )
 
         if name in buffer_dict:
             buffer_dict[name] = tensor.detach().clone()
@@ -493,7 +493,7 @@ def rank0_load_and_broadcast_weights(
 
     def _chunk_and_broadcast_and_dispatch(name, shape, dtype, tensor):
         """Broadcast a single (name, tensor) from rank0 and dispatch it."""
-        logger.info_rank0(f"rank0_load_and_broadcast_weights: chunking and broadcasting {name=}")
+        # logger.info_rank0(f"rank0_load_and_broadcast_weights: chunking and broadcasting {name=}")
 
         assert name not in buffer_dict, f"Buffer {name} should not be chunked."
         assert name in parameter_names_to_load, f"Unexpected key in state dict: {name}."
@@ -669,7 +669,7 @@ def rank0_load_and_broadcast_weights(
                         if converted is None:
                             continue
                         key, tensor = converted.name, converted.tensor
-                        logger.info_rank0(f"loading {key=}")
+                        # logger.info_rank0(f"loading {key=}")
                         if torch.count_nonzero(tensor) == 0:
                             logger.warning_rank0(
                                 f"Detected tensor with all-zero values when reading safetensor: {key=}"
