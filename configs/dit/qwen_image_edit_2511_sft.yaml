@@ -62,6 +62,8 @@ train:
         enable: false
   gradient_checkpointing:
     enable: true
+    sac_policy: none
+  enable_compile: false
   global_batch_size: 64
   micro_batch_size: 1
   init_device: meta

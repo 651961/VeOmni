@@ -133,6 +133,8 @@ bash train.sh tasks/train_dit.py \
     --train.micro_batch_size 1 \
     --train.accelerator.ulysses_size 1 \
     --train.gradient_checkpointing.enable true \
+    --train.gradient_checkpointing.sac_policy attn_rotary_and_mlp \
+    --train.enable_compile true \
     --train.num_train_epochs 20 \
     --train.wandb.enable true \
     --train.wandb.project Qwen-Image-Edit-2511-SFT \
@@ -189,6 +191,68 @@ model:
 
 Setting `loss_outlier_threshold: null` (or removing the field) disables
 the mask entirely.
+
+---
+
+## 3.3 Performance defaults (on in the yaml)
+
+The yaml turns on two compute-side optimizations by default. Both are
+training-only; they do not change loss numerics. Override with
+`--train.gradient_checkpointing.sac_policy <name>` or
+`--train.enable_compile true`.
+
+### Selective Activation Checkpointing (SAC)
+
+`train.gradient_checkpointing.sac_policy: attn_rotary_and_mlp`. Sits on
+top of normal full ckpt: the wrapped scope still recomputes everything
+in backward, *except* the outputs of selected expensive ops which are
+kept live across the forward/backward boundary. For Qwen-Image-Edit-2511
+the saved set is:
+
+| Op | Origin |
+|----|--------|
+| `flash_attn_3::_flash_attn_forward` | FA3 joint-attention call (custom_op) |
+| `veomni::rotary_interleaved_fwd`    | Fused interleaved-rotary triton kernel (custom_op) |
+| `aten.addmm`                        | Every `nn.Linear` (all linears in the model are biased) |
+
+Together these cover virtually all per-block FLOPs, so backward
+recompute drops to layer-norm / activation / elementwise residual only.
+Trade-off is activation memory: each MUST_SAVE op holds its output live
+across all 60 blocks. Available policies (`veomni/distributed/sac.py`):
+
+| Policy | Saves |
+|---|---|
+| `none` | nothing extra (vanilla full ckpt) |
+| `attn_only` | attention only |
+| `attn_rotary` | attention + rotary |
+| `attn_and_mlp` | attention + matmul |
+| `attn_rotary_and_mlp`| all three |
+
+Requires `train.gradient_checkpointing.enable_reentrant: false` (the
+default). Set `VEOMNI_SAC_DEBUG=1` in the env to log every unique
+MUST_SAVE hit once on rank 0 — useful for confirming the policy still
+fires after a torch upgrade or model change.
+
+### torch.compile
+
+`train.enable_compile: true`. After FSDP2 wrap, `DiTTrainer` wraps each
+of the 60 dual-stream blocks with `torch.compile(block)` in the default
+mode (`veomni/trainer/dit_trainer.py:_maybe_compile_mlps`). FA3 and the
+rotary triton kernel are registered as `torch.library.custom_op`, so
+dynamo traces through them without graph breaks.
+
+Caveats:
+
+- **First step is slow**: 60 sequential compiles take minutes. Steady-
+  state is reached from step ~3 onward.
+- **Steady-state speedup is small** on this model (FA3, rotary, cuBLAS
+  matmul are already optimized; inductor has little left to fuse). On
+  top of `attn_rotary_and_mlp` SAC the measured delta is at parity or
+  marginally better. Kept on by default because it costs only the cold
+  start; set `--train.enable_compile false` to skip if you restart
+  often or care about first-step latency.
+- **`max-autotune-no-cudagraphs`** has been measured slower than the
+  default mode on this model — keep the default.
 
 ---
 

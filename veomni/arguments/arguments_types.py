@@ -235,6 +235,26 @@ class GradientCheckpointingConfig:
         default=False,
         metadata={"help": "Use reentrant gradient checkpointing."},
     )
+    sac_policy: Literal[
+        "none", "attn_only", "attn_rotary", "attn_and_mlp", "attn_rotary_and_mlp"
+    ] = field(
+        default="none",
+        metadata={
+            "help": (
+                "Selective Activation Checkpointing policy. "
+                "'none' (default): standard full ckpt; every op recomputed in backward. "
+                "'attn_only': keep fused-attention outputs live, recompute everything else "
+                "(modest memory increase, skips the most expensive recompute work). "
+                "'attn_rotary': also keep the fused interleaved-rotary kernel output "
+                "(veomni::rotary_interleaved_fwd) live; small extra memory, skips rotary recompute. "
+                "'attn_and_mlp': also keep every nn.Linear (aten.mm / aten.addmm) output, "
+                "so no matmul is recomputed in backward (largest speedup, largest memory). "
+                "'attn_rotary_and_mlp': union of attn_rotary and attn_and_mlp; largest memory, "
+                "smallest backward recompute. "
+                "Requires enable_reentrant=False."
+            )
+        },
+    )
 
 
 @dataclass

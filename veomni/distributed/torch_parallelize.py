@@ -32,6 +32,7 @@ from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
 from .checkpoint import CheckpointFunction
 from .parallel_state import get_parallel_state
+from .sac import get_sac_context_fn
 from .utils import sort_fqn_by_submodule_first
 
 
@@ -439,10 +440,29 @@ def build_parallelize_model(
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
+        sac_policy = kwargs.pop("sac_policy", "none")
+        recompute_context_fn = kwargs.pop("recompute_context_fn", None)
+        if sac_policy != "none":
+            if use_reentrant:
+                raise ValueError(
+                    f"sac_policy={sac_policy!r} requires use_reentrant=False "
+                    "(torch.utils.checkpoint rejects context_fn under reentrant mode)."
+                )
+            if recompute_context_fn is not None:
+                raise ValueError(
+                    "Pass either sac_policy or recompute_context_fn, not both."
+                )
+            recompute_context_fn = get_sac_context_fn(sac_policy)
+            logger.info_rank0(
+                f"Selective Activation Checkpointing enabled: policy={sac_policy!r}."
+            )
+        if recompute_context_fn is None:
+            recompute_context_fn = noop_context_fn
+
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={
                 "use_reentrant": use_reentrant,
-                "context_fn": kwargs.pop("recompute_context_fn", noop_context_fn),
+                "context_fn": recompute_context_fn,
             },
         )
 
