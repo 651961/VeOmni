@@ -206,11 +206,28 @@ class DiTTrainer:
 
         if self.training_task != "offline_embedding":
             self.base._build_parallelized_model()
+            self._maybe_compile_mlps()
             self.base._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
 
         self.base._init_callbacks()
+
+    def _maybe_compile_mlps(self):
+        # Compile each transformer block whole after FSDP wrap.  FA3
+        # (flash_attn_3::_flash_attn_forward) and the rotary triton kernel
+        # (veomni::rotary_interleaved_fwd) are both registered as torch
+        # custom_ops with fake meta + autograd, so dynamo can trace through
+        # the attn forward without graph breaks.  The outer gradient
+        # checkpoint still sees no compile, so loss matches eager exactly.
+        if not self.base.args.train.enable_compile:
+            return
+        blocks = getattr(self.base.model, "transformer_blocks", None)
+        if not blocks or not hasattr(blocks[0], "img_mlp"):
+            return
+        for i in range(len(blocks)):
+            blocks[i] = torch.compile(blocks[i])
+        logger.info_rank0(f"Compiled {len(blocks)} transformer_blocks (whole block).")
 
     def _setup(self):
         self.base._setup()

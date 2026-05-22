@@ -58,7 +58,7 @@ from einops import rearrange
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from .....ops.kernels.rotary.triton_wan import ApplyRotaryEmb
+from .....ops.kernels.rotary.triton_wan import ApplyRotaryEmb, apply_rotary_interleaved
 from .....utils import logging
 from .....utils.import_utils import is_liger_kernel_available
 from .configuration_qwen_image_edit_transformer import QwenImageEditTransformerModelConfig
@@ -69,10 +69,93 @@ logger = logging.get_logger(__name__)
 
 try:
     import flash_attn_interface
+    from flash_attn_interface import _flash_attn_forward as _fa3_op_fwd
 
     _FLASH_ATTN_AVAILABLE = True
 except ImportError:
     _FLASH_ATTN_AVAILABLE = False
+    _fa3_op_fwd = None
+
+
+# --------------------------------------------------------------------------- #
+# Dynamo-traceable wrappers for the rotary triton kernel and FA3 forward.
+#
+# flash_attn_3::_flash_attn_forward is already registered upstream as a
+# torch.library.custom_op (with register_fake + register_autograd), so
+# calling it directly bypasses the FlashAttnFunc autograd.Function wrapper
+# (a dynamo black box) and lets dynamo trace the attention call.
+#
+# apply_rotary_interleaved (the triton kernel call) is wrapped below as
+# veomni::rotary_interleaved_fwd with a fake meta + autograd that mirrors
+# ApplyRotaryEmb's conjugate-pass.  dynamo treats this custom_op as
+# opaque, matching the original autograd.Function semantics.
+# --------------------------------------------------------------------------- #
+
+
+def _fa3_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """FA3 forward, dynamo-traceable. Inputs (B, S, H, D); returns (B, S, H, D)."""
+    softmax_scale = q.shape[-1] ** (-0.5)
+    out, _lse, _accum, _lse_accum = _fa3_op_fwd(
+        q, k, v,
+        None, None,        # k_new, v_new
+        None,              # qv
+        None,              # out_
+        None, None, None,  # cu_seqlens_q/k/k_new
+        None, None,        # seqused_q/k
+        None, None,        # max_seqlen_q/k
+        None, None, None,  # page_table, kv_batch_idx, leftpad_k
+        None, None, None,  # rotary_cos/sin, seqlens_rotary
+        None, None, None,  # q_descale, k_descale, v_descale
+        softmax_scale,
+    )
+    return out
+
+
+@torch.library.custom_op("veomni::rotary_interleaved_fwd", mutates_args=())
+def _rotary_interleaved_fwd_op(
+    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    return apply_rotary_interleaved(x, cos, sin, conjugate=False)
+
+
+@_rotary_interleaved_fwd_op.register_fake
+def _rotary_interleaved_fwd_fake(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+# Separate op for the reverse-direction (conjugate=True) triton call. Needed
+# because AOT autograd Python-calls the register_autograd backward during
+# joint-trace with FakeTensors, and a bare triton kernel call would try to
+# access .data_ptr() on the fakes.  Wrapping it as an opaque custom_op makes
+# AOT use the fake meta instead.
+@torch.library.custom_op("veomni::rotary_interleaved_bwd", mutates_args=())
+def _rotary_interleaved_bwd_op(
+    grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    return apply_rotary_interleaved(grad_out, cos, sin, conjugate=True)
+
+
+@_rotary_interleaved_bwd_op.register_fake
+def _rotary_interleaved_bwd_fake(
+    grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty_like(grad_out)
+
+
+def _rotary_interleaved_setup_ctx(ctx, inputs, output):
+    _x, cos, sin = inputs
+    ctx.save_for_backward(cos, sin)
+
+
+def _rotary_interleaved_bwd(ctx, grad_out):
+    cos, sin = ctx.saved_tensors
+    grad_x = _rotary_interleaved_bwd_op(grad_out, cos, sin)
+    return grad_x, None, None
+
+
+_rotary_interleaved_fwd_op.register_autograd(
+    _rotary_interleaved_bwd, setup_context=_rotary_interleaved_setup_ctx
+)
 
 
 if is_liger_kernel_available():
@@ -224,8 +307,9 @@ def _apply_rotary_emb(x: torch.Tensor, freqs_cis) -> torch.Tensor:
     ``freqs_cis`` may be either:
       * a complex tensor of shape ``(S, D/2)`` -- eager complex-multiply path,
       * a ``(cos, sin)`` real-tensor tuple of shape ``(S, D/2)`` each, in
-        which case the fused interleaved-RoPE Triton kernel is used. The
-        kernel's ``(B, S, H, D)`` layout is reached by a stride-only
+        which case the fused interleaved-RoPE Triton kernel is used via the
+        ``veomni::rotary_interleaved_fwd`` custom_op (dynamo-traceable).
+        The kernel's ``(B, S, H, D)`` layout is reached by a stride-only
         ``transpose(1, 2)`` view over the ``(B, H, S, D)`` input; the same
         transpose is undone on the way out.
     The two paths are mathematically identical up to bf16 rounding.
@@ -233,7 +317,7 @@ def _apply_rotary_emb(x: torch.Tensor, freqs_cis) -> torch.Tensor:
     if isinstance(freqs_cis, tuple):
         cos, sin = freqs_cis
         x_bshd = x.transpose(1, 2)
-        out = ApplyRotaryEmb.apply(x_bshd, cos, sin)
+        out = _rotary_interleaved_fwd_op(x_bshd, cos, sin)
         return out.transpose(1, 2)
     x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
@@ -378,18 +462,19 @@ def _flash_or_sdpa_attention(
     ``(B, S, H*D)`` so the downstream per-stream slice + linear projection
     are unchanged from the previous SDPA call.
 
-    The fast path requires ``flash_attn_interface`` to be importable and
-    ``attention_mask`` to be ``None`` (the kernel does not accept additive
-    masks). When either guard fails we drop into SDPA, which accepts the
-    bool/float mask and matches the kernel output up to bf16 rounding.
+    The fast path goes through ``_fa3_attn``, which dispatches directly to
+    the ``flash_attn_3::_flash_attn_forward`` custom_op (registered upstream
+    with fake meta + autograd).  When ``flash_attn_interface`` is unavailable
+    or ``attention_mask`` is not ``None`` we drop into SDPA, which accepts
+    the bool/float mask and matches the kernel output up to bf16 rounding.
+    Both branches are dynamo-traceable, so the caller can be wrapped with
+    ``torch.compile`` directly.
     """
     if _FLASH_ATTN_AVAILABLE and attention_mask is None:
         query = rearrange(query, "b h s d -> b s h d")
         key = rearrange(key, "b h s d -> b s h d")
         value = rearrange(value, "b h s d -> b s h d")
-        out = flash_attn_interface.flash_attn_func(query, key, value)
-        if isinstance(out, tuple):
-            out = out[0]
+        out = _fa3_attn(query, key, value)
         return rearrange(out, "b s h d -> b s (h d)")
     out = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask)
     return rearrange(out, "b h s d -> b s (h d)")
