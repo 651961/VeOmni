@@ -17,15 +17,15 @@ Patch configuration for DeepseekV3 GPU patched modeling generation.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.deepseek_v3.deepseek_v3_gpu_patch_gen_config -o veomni/models/transformers/deepseek_v3/generated --diff
 
-v5 patches:
+Patches:
 1. ``DeepseekV3NaiveMoe`` — drops upstream ``@use_experts_implementation``
-   (which otherwise routes around our fused MoE kernel) and adopts the v5
+   (which otherwise routes around our fused MoE kernel) and adopts the
    stacked ``gate_up_proj [E, 2*I, H]`` / ``down_proj [E, H, I]`` layout.
    Dispatch is OpSlot-guarded (``veomni_moe_experts_forward``): non-eager →
-   ``fused_moe_forward``; eager → per-expert loop. This matches the v4
-   monkey-patch and qwen3_moe v5 dispatch shape (a previous draft keyed on a
-   hand-rolled ``config._moe_implementation`` attribute that was never wired,
-   so EP runs always took the eager loop and crashed on EP-sharded
+   ``fused_moe_forward``; eager → per-expert loop. This matches the
+   qwen3_moe dispatch shape (a previous draft keyed on a hand-rolled
+   ``config._moe_implementation`` attribute that was never wired, so EP runs
+   always took the eager loop and crashed on EP-sharded
    ``gate_up_proj[expert_idx]`` lookups for global expert ids).
 2. ``DeepseekV3TopkRouter.forward`` restores ``torch.autocast(enabled=False)``
    around the fp32 router F.linear — required for VeRL actor/rollout parity.
@@ -37,7 +37,7 @@ v5 patches:
 Liger kernels (RMSNorm / SwiGLU MLP / rotary) are intentionally NOT baked into
 the generated file: DeepseekV3 runs on deterministic Triton RoPE + batch-invariant
 RMSNorm wired at runtime from ``__init__.py`` (via
-``apply_veomni_deepseek_v3_v5_device_patch`` in ``device_patch.py``) for
+``apply_veomni_deepseek_v3_device_patch`` in ``device_patch.py``) for
 actor/rollout numerical parity, and ``LigerSwiGLUMLP`` rejects the
 ``intermediate_size`` kwarg used by ``DeepseekV3MoE.shared_experts``.
 """
@@ -56,7 +56,7 @@ from transformers.utils import TransformersKwargs
 from veomni.ops import fused_moe_forward
 from veomni.ops.dispatch import OpSlot
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutput
 
 
 # ── OpSlot declarations ──────────────────────────────────────────────────────
@@ -79,7 +79,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` can return per-token log-probs in the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 config.add_post_import_block(
     """
@@ -230,10 +233,13 @@ def deepseek_v3_forcausallm_forward_patched(
     logits = None
     log_probs = None
     entropy = None
+    distillation_losses = None
+    student_mass = None
+    teacher_mass = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -246,11 +252,11 @@ def deepseek_v3_forcausallm_forward_patched(
             # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
             # installed by ``install_loss_mapping`` in
             # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-            # ``(loss, logits, log_probs, entropy)`` — *not* HF's stock single
+            # ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`` — *not* HF's stock single
             # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
             # discard the wrapper's flattened ``logits`` and keep the ones we
             # already computed at full shape.
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -269,8 +275,13 @@ def deepseek_v3_forcausallm_forward_patched(
     return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

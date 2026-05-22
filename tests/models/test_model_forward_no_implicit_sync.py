@@ -78,17 +78,20 @@ two-axis rule above:
   dispatches to the fused MoE OpSlot) → allowlist with
   ``"HF-eager-only: ..."``.
 
-Line numbers are into the **generated** file, so a ``make patchgen``
-that shifts lines requires re-checking the allowlist. Dead allowlist
-entries (listed but no longer observed) also fail the test, so drift
-can't silently rot the gate.
+The allowlist is keyed by ``(generated-file, function qualname)``: each
+sync warning's line number is resolved to its enclosing function via AST,
+so a ``make patchgen`` that shifts lines does **not** rot the gate. Dead
+allowlist entries (a function that no longer issues a sync) still fail
+the test, so a landed fix can't silently leave a stale entry behind.
 """
 
+import ast
 import importlib
 import importlib.util
 import os
 import re
 import warnings
+from functools import lru_cache
 
 import pytest
 import torch
@@ -125,6 +128,8 @@ def _logits_case(case_id: str) -> Case:
 # Triton kernel call — no Python-level sync sites.
 _MOE_IMPL_BY_CASE: dict[str, str] = {
     "qwen3_5_moe-text-fa2-fused": "fused_triton",
+    "qwen3_vl_moe-fa2-fused": "fused_triton",
+    "qwen3_omni_moe-fa2-fused": "fused_triton",
 }
 
 
@@ -134,11 +139,11 @@ _MOE_IMPL_BY_CASE: dict[str, str] = {
 # FA2. To extend, add a ``Case`` here (and optionally a ``_MOE_IMPL_BY_CASE``
 # entry for fused-MoE coverage).
 #
-# ``qwen3_5_moe-text-eager`` is intentionally absent: the eager experts
-# loop is HF-verbatim and not the production path (production uses
+# Eager-MoE cases are intentionally absent: the eager experts loop body is
+# HF-verbatim and not the production path (production uses
 # ``veomni_moe_experts_forward`` via OpSlot, exercised by the fa2-fused
-# case below). Gating MoE on that case alone keeps the allowlist focused
-# on VeOmni-patched code.
+# cases below). Gating MoE on the fused path alone keeps the allowlist
+# focused on VeOmni-patched code.
 CASES = [
     # qwen3_5 (non-MoE, text-only sub-config) — both attention paths through
     # our patched Qwen3_5Model.forward.
@@ -155,6 +160,44 @@ CASES = [
         "qwen3_5_text",
         attn_implementation="flash_attention_2",
         dtype="bfloat16",
+    ),
+    # qwen3_5_vl (non-MoE VLM) — exercises the qwen3_5-family ViT
+    # (``Qwen3_5VisionModel.forward`` + ``fast_pos_embed_interpolate`` +
+    # ``rot_pos_emb``) and the VLM path of ``Qwen3_5Model.forward``. The
+    # qwen3_5-text-* cases above are text-only sub-configs and never reach
+    # the vision tower, so this case is what gates the qwen3_5 ViT precompute
+    # consumer. qwen3_5_moe's ViT forward is the *same* imported function, so
+    # one non-MoE case covers the shared ViT.
+    #
+    # SDPA (not FA2) here: FA2+bf16 produces NaN on the qwen3_5 toy config
+    # (an upstream FA-on-tiny-shape issue — see test_models_logits_equal_v5).
+    # The ViT metadata syncs this case gates (cu_seqlens build, .tolist(),
+    # rot_pos_emb) are attention-implementation-independent, so SDPA covers
+    # them exactly as well.
+    _logits_case("qwen3_5_vl-sdpa"),
+    # qwen3_vl (non-MoE VLM) — full multimodal forward with a dummy 2x2
+    # image patch; exercises patched ``Qwen3VLModel.forward`` +
+    # ``get_image_features`` + the vision tower.
+    _logits_case("qwen3_vl-fa2"),
+    # qwen3_vl_moe — production FA2 + fused-Triton MoE on the VLM path.
+    Case(
+        "qwen3_vl_moe-fa2-fused",
+        _toy("qwen3vlmoe_toy"),
+        "Qwen3VLMoeForConditionalGeneration",
+        "vlm_full",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+    ),
+    # qwen3_omni_moe — forward on ``model.thinker`` (talker stays out of
+    # scope); production FA2 + fused-Triton MoE.
+    Case(
+        "qwen3_omni_moe-fa2-fused",
+        _toy("qwen3omni_toy"),
+        "Qwen3OmniMoeForConditionalGeneration",
+        "omni_thinker",
+        attn_implementation="flash_attention_2",
+        dtype="bfloat16",
+        forward_attr="thinker",
     ),
 ]
 
@@ -177,33 +220,170 @@ CASES = [
 #   "algorithm-essential: ..."     accepted by design (EP dispatch
 #                                  sizes, variable per-rank counts).
 #
-# Current entries are all the same upstream HF method
-# ``_update_linear_attn_mask`` (called once per forward from
-# ``Qwen3_5{,Moe}Model.forward`` — production path, fires every step in
-# real Qwen3.5 since half its layers are linear_attention). Both Model
-# classes are MODIFIED CLASSes but ``_update_linear_attn_mask`` is not
-# in either's ``Methods patched`` list, so the line is HF-verbatim.
-# Per the two-axis rule (production + HF-verbatim → add an override
-# patch), it's tracked as ``HF-prod-pending-fix`` and the fix lives on
-# branch ``tingyang/fix/qwen3_5_key_fix``.
-_HF_PROD_PENDING_LINEAR_ATTN = (
-    "HF-prod-pending-fix: _update_linear_attn_mask runs unconditionally in "
-    "Qwen3_5{,Moe}Model.forward (no OpSlot above it). Two syncs: 0-D GPU "
-    "scalar `cache_position[0] > 0` in Python `if`, plus full-tensor "
-    "`torch.all(attention_mask == 1)`. Fix planned via patchgen "
-    "override_method on branch tingyang/fix/qwen3_5_key_fix."
+# Entries for qwen3_vl{,_moe} + qwen3_omni_moe populated by this commit.
+# qwen3_5 / qwen3_5_moe entries (the previous ``HF-prod-pending-fix`` ones
+# for ``_update_linear_attn_mask``) were cleared by the override_method
+# patch in PR #762; that method is now VeOmni-patched and host-side.
+#
+# ``get_rope_index`` in qwen3_vl{,_moe} (called unconditionally from
+# ``Model.forward`` when ``image_grid_thw`` is present, production path).
+# The method itself is HF-verbatim, but the syncs it issues are inherent to
+# the algorithm — per-sample padding strip (``input_ids[attention_mask[i] ==
+# 1]`` GPU boolean indexing, variable-size output), ``torch.argwhere`` for
+# vision_start positions (variable-size), and a one-shot ``input_ids.tolist()``
+# for the inner Python loop. An in-place ``override_method`` doesn't help:
+# trying it (see commit history) actually *increased* the reported sync site
+# count because PyTorch's ``set_sync_debug_mode("warn")`` over-reports inside
+# multi-line Python override bodies (warnings land on comment / blank / pure
+# Python lines), giving more allowlist noise than wins.
+#
+# The clean fix is **out-of-scope for this PR**: precompute the mrope
+# position_ids in the data transform (``get_position_id_func`` already runs
+# there) and short-circuit the ``self.get_rope_index(...)`` call in
+# ``Model.forward`` when position_ids is provided. (rope_deltas is NOT needed
+# — it is generation-only; the training forward never reads it.)
+# Tracked as follow-up: requires transform + forward signature changes
+# across qwen3_vl / qwen3_vl_moe (GPU + NPU).
+_ALG_ESSENTIAL_VL_GET_ROPE_INDEX = (
+    "algorithm-essential: get_rope_index does per-sample padding strip (GPU boolean indexing) + "
+    "argwhere for vision_start positions + a one-shot input_ids.tolist() — intrinsic to the "
+    "variable-shape mrope algorithm. Clean fix is to precompute position_ids in the data "
+    "transform and skip the call; out-of-scope for this PR."
 )
-_ALLOWED_SYNCS: dict[str, dict[tuple[str, int], str]] = {
-    "qwen3_5-text-eager": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
+# Keyed by ``(generated-file basename, enclosing-function qualname)`` — NOT a
+# raw line number. The qualname is resolved from the sync warning's line via
+# AST (`_enclosing_qualname`), so patchgen line shifts no longer rot the
+# allowlist, and each entry reads as the function it accepts. One entry
+# therefore covers *all* the sync sites inside that function.
+_ALLOWED_SYNCS: dict[str, dict[tuple[str, str], str]] = {
+    # qwen3_5_vl-sdpa: like qwen3_vl-fa2 below, the ViT forward consumes the
+    # precomputed multimodal metadata (fast path) — so the ViT's own
+    # `.tolist()` + host-side cu_seqlens build do not appear here. What remains:
+    #  - Qwen3_5VisionAttention.forward: the non-FA varlen-attention branch
+    #    does `torch.split(t, lengths.tolist(), ...)`, an HF-verbatim D2H.
+    #    This is eager/SDPA-only — production qwen3_5-VL uses FA2 (the
+    #    `is_flash_attention_requested` branch, which hands cu_seqlens to
+    #    flash_attn_varlen_func directly, no `.tolist()`). This case is forced
+    #    onto SDPA only because FA2 NaNs on the toy config, so the sync is on
+    #    a path production bypasses → tagged HF-eager-only.
+    #  - get_rope_index: the HF-verbatim mrope algorithm (same as qwen3_vl).
+    "qwen3_5_vl-sdpa": {
+        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5VisionAttention.forward"): (
+            "HF-eager-only: the non-FA branch's `torch.split(t, lengths.tolist(), ...)` "
+            "varlen split is an HF-verbatim D2H. Production qwen3_5-VL uses FA2, which "
+            "passes cu_seqlens to flash_attn_varlen_func directly and bypasses this; the "
+            "case runs SDPA only because FA2 NaNs on the toy config."
+        ),
+        ("patched_modeling_qwen3_5_gpu.py", "Qwen3_5Model.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    "qwen3_5-text-fa2": {
-        ("patched_modeling_qwen3_5_gpu.py", 1750): _HF_PROD_PENDING_LINEAR_ATTN,
+    # qwen3_vl-fa2: the ViT forward consumes the precomputed multimodal
+    # metadata — Model.forward selects the per-modality `vit_metadata` sub-dict
+    # from `multimodal_metadata` (which the toy test injects via
+    # _attach_multimodal_metadata above) and threads it to the ViT. So this
+    # case runs the precompute *fast path* and skips the fallback `.tolist()`
+    # + host-side cu_seqlens build that would otherwise fire ~4 syncs. The
+    # entries below are therefore the residual syncs that survive even on the
+    # fast path — not eliminable by precompute:
+    #  - rot_pos_emb: an algorithm-essential `rot_pos_ids(...).to(device)` H2D
+    #    copy (CPU-side lru_cached helper output, over-reported by sync-debug).
+    #  - get_rope_index: the HF-verbatim mrope algorithm; see the long comment
+    #    above _ALG_ESSENTIAL_VL_GET_ROPE_INDEX for why the in-place override
+    #    was reverted and the collator-side fix tracked as follow-up.
+    "qwen3_vl-fa2": {
+        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLVisionModel.rot_pos_emb"): (
+            "algorithm-essential: `rot_pos_ids(...).to(device)` H2D copy of a CPU tensor "
+            "returned by the lru_cached helper; over-reported by torch sync-debug mode."
+        ),
+        ("patched_modeling_qwen3_vl_gpu.py", "Qwen3VLModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
     },
-    "qwen3_5_moe-text-fa2-fused": {
-        ("patched_modeling_qwen3_5_moe_gpu.py", 1955): _HF_PROD_PENDING_LINEAR_ATTN,
+    # qwen3_vl_moe-fa2-fused: mirrors qwen3_vl (the moe config imports the
+    # vision forward / rot_pos_emb / fast_pos_embed_interpolate helpers from
+    # qwen3_vl and registers its own Model.forward + get_rope_index).
+    "qwen3_vl_moe-fa2-fused": {
+        ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeVisionModel.rot_pos_emb"): (
+            "algorithm-essential: see qwen3_vl-fa2 (rot_pos_ids H2D copy)."
+        ),
+        ("patched_modeling_qwen3_vl_moe_gpu.py", "Qwen3VLMoeModel.get_rope_index"): _ALG_ESSENTIAL_VL_GET_ROPE_INDEX,
+    },
+    # qwen3_omni_moe-fa2-fused: Stage 2 (multimodal_metadata_precompute) wired
+    # the omni ViT forward to consume the precomputed cu_seqlens / max_seqlen,
+    # so the ViT's own `.tolist()` + `torch.tensor(cu_seqlens_list)` fallback
+    # syncs are gone. The omni ViT still calls upstream-HF
+    # `fast_pos_embed_interpolate` / `rot_pos_emb` with the GPU `grid_thw`
+    # tensor (those helpers were not migrated to the host list — unlike
+    # qwen3_vl), so algorithm-essential D2H/H2D sites remain, documented
+    # in PR #764. Full omni ViT-helper migration is tracked as follow-up.
+    "qwen3_omni_moe-fa2-fused": {
+        ("patched_modeling_qwen3_omni_moe_gpu.py", "Qwen3OmniMoeVisionEncoder.rot_pos_emb"): (
+            "algorithm-essential: D2H `grid_thw.tolist()` for the rot_pos_emb host-side loop."
+        ),
+        ("patched_modeling_qwen3_omni_moe_gpu.py", "Qwen3OmniMoeVisionEncoder.fast_pos_embed_interpolate"): (
+            "algorithm-essential: D2H `grid_thw.tolist()` + `torch.tensor(idx/weight_list, "
+            "device=cuda)` H2D copies in fast_pos_embed_interpolate; over-reported by sync-debug."
+        ),
     },
 }
+
+# Cases that are *declared* in CASES but skipped at runtime because they
+# currently surface VeOmni-touched sync sites we haven't fixed yet.
+# Under the gate's principle (VeOmni-patched syncs get fixed, not
+# allowlisted), it would be misleading to add these to ``_ALLOWED_SYNCS``;
+# the skip keeps the case visible in pytest output as a reminder. The
+# skip reason should name the offending functions and the follow-up.
+# Currently empty — all declared cases pass or are fully allowlisted.
+_PENDING_FIX_CASES: dict[str, str] = {}
+
+
+# Cases that have been wired to consume ``multimodal_metadata`` via the
+# patched ViT / Model forwards (see
+# .agents/knowledge/multimodal_metadata.md). For these, the test attaches
+# a metadata dict to ``fwd_kwargs`` mirroring what VeOmni's MainCollator
+# would emit in real training, so the consumer fast path is exercised
+# and the corresponding fallback-path syncs disappear from the allowlist.
+_MM_METADATA_WIRED_CASES: set[str] = {
+    "qwen3_5_vl-sdpa",
+    "qwen3_vl-fa2",
+    "qwen3_vl_moe-fa2-fused",
+    "qwen3_omni_moe-fa2-fused",
+}
+
+
+def _attach_multimodal_metadata(case: Case, fwd_kwargs: dict) -> None:
+    """Inject a synthetic ``multimodal_metadata`` dict for opted-in cases.
+
+    Builds the same fields the model's ``collate_multimodal_metadata``
+    hook (returned by ``get_metadata_collate_func``) would produce for the
+    toy single-image input used by ``_make_inputs`` (1 image with
+    ``grid_thw == [[1, m, m]]``). No-op for cases that haven't been wired
+    in their model patches yet.
+    """
+    if case.case_id not in _MM_METADATA_WIRED_CASES:
+        return
+    image_grid_thw = fwd_kwargs.get("image_grid_thw")
+    if image_grid_thw is None:
+        return
+    # ``_make_inputs`` builds an image-only toy multimodal input (dummy 2x2
+    # image, no video). This helper therefore only synthesises the
+    # ``vit_image_*`` keys. If a future toy input adds ``pixel_values_videos``
+    # the video ViT path would silently take the runtime fallback — assert
+    # the invariant so that change can't pass unnoticed.
+    assert "pixel_values_videos" not in fwd_kwargs, (
+        "_attach_multimodal_metadata only synthesises image metadata; "
+        "extend it for vit_video_* before adding a video toy input."
+    )
+    image_grid_thw_list = image_grid_thw.tolist()
+    cu_list = [0]
+    max_hw = 0
+    for t, h, w in image_grid_thw_list:
+        hw = h * w
+        max_hw = max(max_hw, hw)
+        for _ in range(t):
+            cu_list.append(cu_list[-1] + hw)
+    fwd_kwargs["multimodal_metadata"] = {
+        "image_grid_thw_list": image_grid_thw_list,
+        "vit_image_cu_seqlens": torch.tensor(cu_list, dtype=torch.int32, device=image_grid_thw.device),
+        "vit_image_max_seqlen": max_hw,
+    }
 
 
 # torch's implicit-sync warning message; emitted by
@@ -218,6 +398,87 @@ def _is_generated_path(filename: str) -> bool:
     # almost always absolute, but relative-path edge cases (zip imports,
     # custom loaders) shouldn't silently bypass the gate.
     return "veomni/models/transformers/" in norm and "/generated/" in norm
+
+
+@lru_cache(maxsize=None)
+def _def_spans(path: str) -> tuple[tuple[int, int, str], ...]:
+    """``(start_lineno, end_lineno, qualname)`` for every def in a Python file.
+
+    AST-parsed once per file (lru_cached). Used to map a sync warning's raw
+    line number onto the *qualified name* of the function/method that
+    contains it — a key that survives patchgen line shifts, unlike the line
+    number itself.
+    """
+    with open(path, encoding="utf-8") as f:
+        tree = ast.parse(f.read(), filename=path)
+    spans: list[tuple[int, int, str]] = []
+
+    def walk(node: ast.AST, prefix: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualname = prefix + child.name
+                # ``lineno`` is the ``def`` line, not the decorator line: a
+                # sync warning on a decorator *above* the def would resolve to
+                # the enclosing scope. None of the allowlisted functions are
+                # decorated, so this is not a live concern — revisit if a
+                # patched/HF def with a sync ever gains a decorator.
+                spans.append((child.lineno, child.end_lineno, qualname))
+                walk(child, qualname + ".")  # nested defs / closures
+            elif isinstance(child, ast.ClassDef):
+                walk(child, prefix + child.name + ".")
+            else:
+                # Recurse through non-def blocks (``if`` / ``try`` / ``with``
+                # version gates, etc.) keeping the same prefix — a def inside
+                # them is still at the enclosing scope, and missing it would
+                # misattribute its syncs to ``<module>``.
+                walk(child, prefix)
+
+    walk(tree, "")
+    return tuple(spans)
+
+
+def _enclosing_qualname(path: str, lineno: int) -> str:
+    """Qualified name of the innermost def at ``lineno`` (``"<module>"`` if none).
+
+    "Innermost" = the smallest line span covering ``lineno``, so a sync inside
+    a nested helper resolves to the helper, not its parent.
+    """
+    best, best_span = "<module>", None
+    for start, end, qualname in _def_spans(path):
+        if start <= lineno <= end and (best_span is None or end - start < best_span):
+            best, best_span = qualname, end - start
+    return best
+
+
+def test_enclosing_qualname_resolution(tmp_path):
+    """`_enclosing_qualname` maps a line onto its innermost def — the property
+    the line-shift-proof allowlist keying depends on. CPU-only, no GPU."""
+    src = (
+        "import torch\n"  # 1  module-level
+        "\n"  # 2
+        "def helper():\n"  # 3
+        "    x = 1\n"  # 4  helper
+        "    return x\n"  # 5  helper
+        "\n"  # 6
+        "class Foo:\n"  # 7
+        "    def bar(self):\n"  # 8  Foo.bar
+        "        def inner():\n"  # 9  Foo.bar.inner
+        "            return 0\n"  # 10 Foo.bar.inner
+        "        return inner()\n"  # 11 Foo.bar
+        "\n"  # 12
+        "if True:\n"  # 13
+        "    def gated():\n"  # 14 gated (def inside an `if` block)
+        "        return 1\n"  # 15 gated
+    )
+    f = str(tmp_path / "m.py")
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    assert _enclosing_qualname(f, 1) == "<module>"
+    assert _enclosing_qualname(f, 4) == "helper"
+    assert _enclosing_qualname(f, 10) == "Foo.bar.inner"  # innermost def wins
+    assert _enclosing_qualname(f, 11) == "Foo.bar"
+    # def inside an `if` block: still resolved (not misattributed to <module>).
+    assert _enclosing_qualname(f, 15) == "gated"
 
 
 # NCCL bootstrap env so this module is runnable on its own (``pytest
@@ -303,6 +564,8 @@ def test_no_implicit_sync_in_generated_forward(case):
 
         if not is_fused_moe_available():
             pytest.skip("fused_triton MoE requires triton + CUDA SM70+.")
+    if case.case_id in _PENDING_FIX_CASES:
+        pytest.skip(f"Pending fix: {_PENDING_FIX_CASES[case.case_id]}")
 
     _apply_determinism()
 
@@ -310,6 +573,15 @@ def test_no_implicit_sync_in_generated_forward(case):
     dtype = _DTYPE_MAP[case.dtype]
     config = _make_config(case)
     input_ids, fwd_kwargs = _make_inputs(case, config, device, dtype)
+    # Augment toy inputs with the multimodal_metadata that VeOmni's
+    # MainCollator would produce in real training. This exercises the
+    # precompute consumer path in patched Model.forward / ViT.forward,
+    # mirroring the contract documented in
+    # .agents/knowledge/multimodal_metadata.md. Cases that opt in here
+    # have their corresponding ViT-side fallback syncs removed from the
+    # allowlist below; cases that haven't been wired in patch_gen_config
+    # yet keep the fallback entries in ``_ALLOWED_SYNCS``.
+    _attach_multimodal_metadata(case, fwd_kwargs)
 
     model = _build_veomni_model(case, config)
     target = _forward_target(model, case)
@@ -346,30 +618,38 @@ def test_no_implicit_sync_in_generated_forward(case):
     _release()
 
     allowed = _ALLOWED_SYNCS.get(case.case_id, {})
-    captured_sites = {(os.path.basename(f), ln) for (f, ln, _) in captured if _is_generated_path(f)}
-    offending = [
-        (f, ln, msg) for (f, ln, msg) in captured if _is_generated_path(f) and (os.path.basename(f), ln) not in allowed
-    ]
-    # Dead allowlist entries: listed but no longer observed. Usually means
-    # the patch was fixed (good — delete the entry) or that patchgen
-    # shifted line numbers (re-check the underlying code, then update).
-    dead = sorted(k for k in allowed if k not in captured_sites)
+
+    # Resolve each sync warning from generated/ to the *qualified name* of the
+    # function it fired in (``(basename, qualname)``). Keying on the qualname
+    # rather than a raw line number means patchgen line shifts no longer rot
+    # the allowlist — and one entry covers every sync site inside a function.
+    # One representative line number per key is kept for the failure report.
+    observed: dict[tuple[str, str], tuple[int, str]] = {}
+    for f, ln, msg in captured:
+        if not _is_generated_path(f):
+            continue
+        key = (os.path.basename(f), _enclosing_qualname(f, ln))
+        observed.setdefault(key, (ln, msg.splitlines()[0]))
+
+    offending = sorted(k for k in observed if k not in allowed)
+    # Dead allowlist entries: a function that no longer issues any sync.
+    # Means the patch was fixed (good — delete the entry); line shifts can
+    # no longer cause this, since the key is the qualname.
+    dead = sorted(k for k in allowed if k not in observed)
 
     if offending or dead:
         problems: list[str] = []
         if offending:
-            # Dedup ``(basename, lineno)`` — even with ``simplefilter("always")``
-            # one site can fire many times (per layer, per expert, ...);
-            # the reliable signal is the *set* of sites.
-            unique = {(os.path.basename(f), ln): m.splitlines()[0] for (f, ln, m) in offending}
-            formatted = "\n".join(f"  {f}:{ln}  ::  {m}" for (f, ln), m in sorted(unique.items()))
+            formatted = "\n".join(
+                f"  {bn} :: {qn}  (e.g. line {observed[bn, qn][0]})  ::  {observed[bn, qn][1]}" for bn, qn in offending
+            )
             problems.append(
-                f"{len(unique)} new implicit CUDA sync site(s) in generated modeling:\n"
+                f"{len(offending)} new implicit CUDA sync site(s) in generated modeling:\n"
                 f"{formatted}\n"
-                f"Each line is into the generated file. Triage along two axes (owner + path):\n"
+                f"Each entry is the function the sync fires in. Triage along two axes (owner + path):\n"
                 f"  1. Check the patchgen .diff next to the generated file.\n"
-                f"     Line is *in the .diff* (added/modified by VeOmni) -> ours.\n"
-                f"     Line is *unchanged from HF* -> HF-verbatim.\n"
+                f"     Code is *in the .diff* (added/modified by VeOmni) -> ours.\n"
+                f"     Code is *unchanged from HF* -> HF-verbatim.\n"
                 f"  2. Check whether the code is on the production path or only on an\n"
                 f"     eager/fallback path that production bypasses (e.g. via an OpSlot).\n"
                 f"Then act:\n"
@@ -380,16 +660,15 @@ def test_no_implicit_sync_in_generated_forward(case):
                 f"    In the meantime, allowlist with reason 'HF-prod-pending-fix: ...'.\n"
                 f"  - Eager-only fallback + HF-verbatim -> allowlist with reason\n"
                 f"    'HF-eager-only: ...'.\n"
-                f"Add the (basename, lineno) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
+                f"Add the (basename, qualname) to _ALLOWED_SYNCS[{case.case_id!r}] with the\n"
                 f"appropriate tag prefix."
             )
         if dead:
-            dead_fmt = "\n".join(f"  {f}:{ln}" for (f, ln) in dead)
+            dead_fmt = "\n".join(f"  {bn} :: {qn}" for bn, qn in dead)
             problems.append(
                 f"{len(dead)} dead _ALLOWED_SYNCS entr{'y' if len(dead) == 1 else 'ies'} "
                 f"for {case.case_id!r} (allowlisted but no longer observed):\n"
                 f"{dead_fmt}\n"
-                f"Either the patch was fixed (drop the entry) or patchgen shifted lines "
-                f"(re-check the source and update the lineno)."
+                f"That function no longer issues a sync — drop the entry."
             )
         raise AssertionError(f"[{case.case_id}]\n" + "\n\n".join(problems))

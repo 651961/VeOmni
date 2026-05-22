@@ -51,7 +51,7 @@ from veomni.distributed.sequence_parallel import (
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import Qwen2_5_VLCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5_VLCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -77,7 +77,10 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # would bypass ModelOutput pytree flattening, breaking FSDP2's pre-backward
 # unshard hook on ``lm_head`` and triggering ``setStorage … storage of
 # size 0`` in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["Qwen2_5_VLCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen2_5_VLCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("Qwen2_5_VLCausalLMOutputWithPast")
 
 config.add_post_import_block(
@@ -224,6 +227,16 @@ def qwen2_5_vit_forward_patched(
     grid_thw: torch.Tensor,
     **kwargs,
 ) -> BaseModelOutputWithPooling:
+    # qwen2_5_vl ViT has a window-attention path (cu_window_seqlens) on top
+    # of the cu_seqlens path. Its cu_window_seqlens depends on the
+    # spatial-merge window index and isn't trivially collator-derivable, so
+    # this ViT doesn't yet consume the precomputed multimodal_metadata. Pop
+    # the `vit_metadata` kwarg here so it doesn't leak into the per-block call
+    # below; ignoring it is safe because the in-forward derivation is the
+    # same value the collator would produce.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("vit_metadata", None)
+
     hidden_states = self.patch_embed(hidden_states)
     rotary_pos_emb = self.rot_pos_emb(grid_thw)
     window_index, cu_window_seqlens = self.get_window_index(grid_thw)
@@ -520,6 +533,16 @@ def qwen2_5_vl_model_forward_patched(
             flash_attn_kwargs[key] = kwargs.pop(key)
     # --- Patch.3 ---
 
+    # --- Patch.7 ---
+    # Drain ``multimodal_metadata`` from kwargs even though qwen2_5_vl's ViT
+    # doesn't yet consume the precomputed cu_seqlens (its window-attention
+    # path adds complexity that's deferred to a follow-up). Popping here
+    # prevents the dict from leaking through ``**kwargs`` into downstream
+    # transformers code that doesn't expect it.
+    # See .agents/knowledge/multimodal_metadata.md.
+    kwargs.pop("multimodal_metadata", None)
+    # --- Patch.7 ---
+
     # --- Patch.1 ---
     if get_parallel_state().sp_enabled:
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
@@ -728,10 +751,13 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
     logits = None
     log_probs = None
     entropy = None
+    distillation_losses = None
+    student_mass = None
+    teacher_mass = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -741,7 +767,7 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -764,6 +790,11 @@ def qwen2_5_vl_for_conditional_generation_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
     )

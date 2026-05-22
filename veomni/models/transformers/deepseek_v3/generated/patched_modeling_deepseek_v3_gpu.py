@@ -55,7 +55,7 @@ from veomni.ops import fused_moe_forward
 # ── OpSlot declarations ──────────────────────────────────────────────────
 # Bound at model-build time by _bind_veomni_ops() in auto.py.
 from veomni.ops.dispatch import OpSlot
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutput
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -787,27 +787,32 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         logits = None
         log_probs = None
         entropy = None
+        distillation_losses = None
+        student_mass = None
+        teacher_mass = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy = veomni_causal_lm_loss(
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    **kwargs,
+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
+                    veomni_causal_lm_loss(
+                        logits=logits,
+                        labels=labels,
+                        vocab_size=self.config.vocab_size,
+                        hidden_states=hidden_states,
+                        weights=self.lm_head.weight,
+                        **kwargs,
+                    )
                 )
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched ``loss_function`` (via LOSS_MAPPING,
                 # installed by ``install_loss_mapping`` in
                 # ``veomni/ops/kernels/cross_entropy/__init__.py``) returns
-                # ``(loss, logits, log_probs, entropy)`` — *not* HF's stock single
+                # ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`` — *not* HF's stock single
                 # ``Tensor``. Unpack 4 values to match the OpSlot branch above; we
                 # discard the wrapper's flattened ``logits`` and keep the ones we
                 # already computed at full shape.
-                loss, _, log_probs, entropy = self.loss_function(
+                loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -826,8 +831,13 @@ class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
         return CausalLMOutputWithLogProbs(
             loss=loss,
             logits=logits,
-            log_probs=log_probs,
-            entropy=entropy,
+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+                log_probs=log_probs,
+                entropy=entropy,
+                distillation_losses=distillation_losses,
+                student_mass=student_mass,
+                teacher_mass=teacher_mass,
+            ),
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,

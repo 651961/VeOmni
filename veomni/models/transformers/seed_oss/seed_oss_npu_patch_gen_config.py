@@ -17,9 +17,19 @@ Patch configuration for SeedOss NPU fused-operator replacements.
 Regen command:
 python -m veomni.patchgen.run_codegen veomni.models.transformers.seed_oss.seed_oss_npu_patch_gen_config -o veomni/models/transformers/seed_oss/generated
 
-This mirrors the runtime NPU patch in
-veomni/models/transformers/seed_oss/npu_patch.py and the fused-CE patch in
-veomni/models/transformers/seed_oss/modeling_seed_oss.py.
+Patches:
+- ``apply_rotary_pos_emb`` -> ``veomni.ops.kernels.rotary.npu.apply_rotary_pos_emb_npu``
+  (NPU fused rotary embedding).
+- ``SeedOssRMSNorm.forward`` -> ``veomni.ops.kernels.rms_norm.npu.rms_norm_forward_npu``
+  (NPU fused RMSNorm).
+- ``SeedOssForCausalLM.forward``: OpSlot guard for fused cross-entropy loss
+  (falls through to the eager HF loss path when no fused kernel is bound) and
+  returns the unified ``CausalLMOutputWithLogProbs`` dataclass so callers can
+  surface per-token log-probs / entropy alongside the loss.
+
+This file itself is not runnable — it is the declarative source of truth for
+the runnable explicitly-patched modeling file
+"generated/patched_modeling_seed_oss_npu.py".
 """
 
 from typing import Optional
@@ -32,7 +42,7 @@ from transformers.utils import TransformersKwargs
 
 from veomni.ops.dispatch import OpSlot
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import CausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import CausalLMOutputWithLogProbs, FusedLinearAuxOutput
 
 
 # ── OpSlot declarations ──────────────────────────────────────────────────────
@@ -52,7 +62,10 @@ config = PatchConfig(
 
 # Surface ``CausalLMOutputWithLogProbs`` in the generated file so the patched
 # ``forward`` can return per-token log-probs in the unified output dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)
 
 config.add_post_import_block(
     """
@@ -136,10 +149,13 @@ def seed_oss_forcausallm_forward_patched(
     logits = None
     log_probs = None
     entropy = None
+    distillation_losses = None
+    student_mass = None
+    teacher_mass = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -149,7 +165,7 @@ def seed_oss_forcausallm_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs, entropy = self.loss_function(
+            loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -167,8 +183,13 @@ def seed_oss_forcausallm_forward_patched(
     return CausalLMOutputWithLogProbs(
         loss=loss,
         logits=logits,
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
         past_key_values=outputs.past_key_values,
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,

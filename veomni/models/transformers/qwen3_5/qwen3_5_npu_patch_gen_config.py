@@ -38,17 +38,24 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
     qwen3_5_decoder_layer_forward_patched,
     qwen3_5_forcausallm_forward_patched,
     qwen3_5_forconditional_generation_forward_patched,
+    qwen3_5_forconditional_generation_get_metadata_collate_func,
     qwen3_5_forconditional_generation_get_position_id_func,
     qwen3_5_gated_deltanet_get_local_conv1d_weight,
     qwen3_5_gated_deltanet_init_patched,
     qwen3_5_model_forward,
     qwen3_5_model_get_image_features,
     qwen3_5_model_get_placeholder_mask,
+    qwen3_5_text_model_update_linear_attn_mask,
     qwen3_5_vision_model_dummy_forward,
     qwen3_5_vision_model_fast_pos_embed_interpolate,
     qwen3_5_vision_model_forward,
+    qwen3_5_vision_model_rot_pos_emb,
 )
 from veomni.patchgen.patch_spec import PatchConfig
+from veomni.utils.model_outputs import (  # noqa: F401  consumed by in-config dataclass + emitted forward
+    FusedLinearAuxOutput,
+    FusedLinearAuxOutputMixin,
+)
 
 
 config = PatchConfig(
@@ -68,6 +75,7 @@ config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
     names=["gather_seq_scatter_heads", "gather_heads_scatter_seq"],
 )
+
 # gather_outputs / slice_input_tensor live in veomni.distributed.sequence_parallel.data
 # (re-exported by the package __init__), not in .ulysses.
 config.add_import(
@@ -77,7 +85,10 @@ config.add_import("veomni.utils.constants", names=["IMAGE_INPUT_INDEX", "VIDEO_I
 # Surface ``CausalLMOutputWithLogProbs`` so the patched ``forward`` (re-used
 # from the GPU config) can return per-token log-probs in the unified output
 # dataclass.
-config.add_import("veomni.utils.model_outputs", names=["CausalLMOutputWithLogProbs"])  # noqa: F401
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "CausalLMOutputWithLogProbs"],
+)  # noqa: F401
 config.drop_import_names(
     "FusedRMSNormGated",
     "causal_conv1d_fn",
@@ -406,6 +417,13 @@ config.override_method(
 
 
 config.override_method(
+    "Qwen3_5TextModel._update_linear_attn_mask",
+    replacement=qwen3_5_text_model_update_linear_attn_mask,
+    description="Avoid host-device sync: decide linear-attention padding-mask zeroing without reading GPU scalars.",
+)
+
+
+config.override_method(
     "Qwen3_5Model.get_image_features",
     replacement=qwen3_5_model_get_image_features,
     description="Remove unnecessary split operation to maintain contiguous memory layout.",
@@ -416,6 +434,13 @@ config.override_method(
     "Qwen3_5Model.get_placeholder_mask",
     replacement=qwen3_5_model_get_placeholder_mask,
     description="Extract multimodal placeholder masks from input_ids using self-defined placeholder IDs.",
+)
+
+
+config.override_method(
+    "Qwen3_5VisionModel.rot_pos_emb",
+    replacement=qwen3_5_vision_model_rot_pos_emb,
+    description="Accept pre-materialized grid_thw metadata to avoid redundant host sync in vision RoPE setup.",
 )
 
 
@@ -463,6 +488,41 @@ def get_position_id(main_func, self, **kwargs):
     # Must be a module-level function for multiprocessing pickle
     position_ids, rope_deltas = main_func(self, **kwargs)
     return {"position_ids": position_ids, "rope_deltas": rope_deltas}
+
+
+def collate_multimodal_metadata(batch, sp_pad):
+    \"\"\"Derive ``multimodal_metadata`` for the Qwen3.5-VL ViT (CPU-side).
+
+    Module-level so ``get_metadata_collate_func`` can hand it to VeOmni's
+    collator as a picklable callable. See the GPU config for the full
+    rationale. Mutates ``batch`` in place, writing ``multimodal_metadata``.
+    \"\"\"
+    md = {}
+    for list_key in ("image_grid_thw_list", "video_grid_thw_list"):
+        if list_key in batch:
+            md[list_key] = batch.pop(list_key)
+    for modality, list_key, pad_key in (
+        ("image", "image_grid_thw_list", "pixel_values"),
+        ("video", "video_grid_thw_list", "pixel_values_videos"),
+    ):
+        grid_list = md.get(list_key)
+        if not grid_list:
+            continue
+        cu = [0]
+        max_hw = 0
+        for t, h, w in grid_list:
+            hw = h * w
+            max_hw = max(max_hw, hw)
+            for _ in range(t):
+                cu.append(cu[-1] + hw)
+        pad = sp_pad.get(pad_key, 0)
+        if pad > 0:
+            cu.append(cu[-1] + pad)
+            max_hw = max(max_hw, pad)
+        md[f"vit_{modality}_cu_seqlens"] = torch.tensor(cu, dtype=torch.int32, device="cpu")
+        md[f"vit_{modality}_max_seqlen"] = max_hw
+    if md:
+        batch["multimodal_metadata"] = md
 """)
 
 
@@ -470,6 +530,13 @@ config.override_method(
     "Qwen3_5ForConditionalGeneration.get_position_id_func",
     replacement=qwen3_5_forconditional_generation_get_position_id_func,
     description="Expose get_position_id_func to pre-computes position IDs per sample during data preprocessing in worker processes.",
+)
+
+
+config.override_method(
+    "Qwen3_5ForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_5_forconditional_generation_get_metadata_collate_func,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 
@@ -484,7 +551,7 @@ config.override_method(
 # for why @auto_docstring is intentionally skipped here.
 @config.add_helper_after("Qwen3_5CausalLMOutputWithPast")
 @dataclass
-class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
+class Qwen3_5CausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5CausalLMOutputWithPast):
     """``Qwen3_5CausalLMOutputWithPast`` extended with per-token log-prob fields.
 
     log_probs (`torch.FloatTensor`, *optional*):
@@ -492,6 +559,3 @@ class Qwen3_5CausalLMOutputWithLogProbs(Qwen3_5CausalLMOutputWithPast):
     entropy (`torch.FloatTensor`, *optional*):
         Per-token softmax entropy returned by VeOmni's fused loss path.
     """
-
-    log_probs: torch.FloatTensor | None = None
-    entropy: torch.FloatTensor | None = None

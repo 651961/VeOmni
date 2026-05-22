@@ -16,9 +16,7 @@ from ..tools.training_utils import make_eager_ops_config
 from .utils import prepare_exec_cmd
 
 
-# transformers v5 only — the v4 CI lane was retired together with the
-# broader transformers v4 wind-down. v4-only models that have not yet
-# been migrated to patchgen are commented out in their respective case
+# Models without a patchgen path are commented out in their respective case
 # lists with a TODO; uncomment once the corresponding model gains a v5
 # patchgen path.
 _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires diffusers")
@@ -27,6 +25,7 @@ _dit_only = pytest.mark.skipif(not is_diffusers_available(), reason="Requires di
 _qwen3_5_npu_skip = pytest.mark.skipif(
     IS_NPU_AVAILABLE, reason="Qwen3.5 GatedDeltaNet has no NPU backend (varlen path)"
 )
+_qwen_image_npu_skip = pytest.mark.skipif(IS_NPU_AVAILABLE, reason="Qwen-Image training is GPU-only for now")
 
 
 def _materialize_weights_dir(config_path: str, output_path: str, save_original_format: bool = True) -> Path:
@@ -235,6 +234,18 @@ wan_dit_test_cases = [
     ),
 ]
 
+qwen_image_dit_test_cases = [
+    pytest.param(
+        "qwen_image",
+        "./tests/toy_config/qwen_image_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        1,  # Ulysses SP for Qwen-Image needs a model-specific joint-attention patch.
+        marks=[_dit_only, _qwen_image_npu_skip],
+    ),
+]
+
 
 @pytest.fixture(scope="session")
 def dummy_text_dataset():
@@ -279,6 +290,14 @@ def dummy_qwen3omni_dataset():
 @pytest.fixture(scope="session")
 def dummy_wan_t2v_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="wan_t2v")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_qwen_image_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen_image")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -388,4 +407,27 @@ def test_wan_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_wan_t2v_dataset,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_test_cases)
+def test_qwen_image_dit_parallel_align(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int,
+    dummy_qwen_image_dataset,
+):
+    """Validate Qwen-Image toy training under FSDP2 without Ulysses SP."""
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_qwen_image_dataset,
+        max_sp_size=max_sp_size,
     )

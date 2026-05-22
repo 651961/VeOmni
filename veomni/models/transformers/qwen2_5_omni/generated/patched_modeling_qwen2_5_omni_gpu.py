@@ -41,6 +41,8 @@
 #      Forward through thinker only (talker / token2wav not trained via this path)
 #    - method_override: Qwen2_5OmniForConditionalGeneration.get_position_id_func
 #      Delegate position-id computation to the thinker submodule
+#    - method_override: Qwen2_5OmniForConditionalGeneration.get_extra_collate_infos
+#      Declare omni-specific (audio) collate rules for the VeOmni collator
 #
 # ==============================================================================
 
@@ -99,7 +101,7 @@ from veomni.models.transformers.attention_utils import VARLEN_ATTENTION_TYPES
 # are inference-only speech paths excluded from the generated file).
 from veomni.ops.dispatch import OpSlot
 from veomni.utils.constants import AUDIO_INPUT_INDEX, IGNORE_INDEX, IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen2_5OmniThinkerCausalLMOutputWithLogProbs
 
 
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
@@ -1398,6 +1400,13 @@ class Qwen2_5OmniVisionEncoder(Qwen2_5OmniPreTrainedModel):
         Returns:
             `BaseModelOutputWithPooling`: last_hidden_state and pooler_output.
         """
+        # qwen2_5_omni ViT has the same window-attention layout as qwen2_5_vl,
+        # so it doesn't yet consume the precomputed multimodal_metadata; the
+        # in-forward cu_seqlens / cu_window_seqlens build stays as-is. Pop the
+        # `vit_metadata` kwarg so it doesn't leak into per-block kwargs below.
+        # See .agents/knowledge/multimodal_metadata.md.
+        kwargs.pop("vit_metadata", None)
+
         hidden_states = self.patch_embed(hidden_states)
         rotary_pos_emb = self.rot_pos_emb(grid_thw)
 
@@ -2125,7 +2134,7 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
     #    order.
     # 5. [Loss] Delegate loss to OpSlot-guarded `veomni_causal_lm_loss` first,
     #    then fall back to `self.loss_function` (VeOmni's patched LOSS_MAPPING
-    #    returns `(loss, logits, log_probs, entropy)`).
+    #    returns `(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)`).
     # 6. [Data] Filter zero-length audio_feature_lengths (placeholder entries
     #    for videos without audio) before forwarding the audio tower.
     # 7. [LogProbs] Return Qwen2_5OmniThinkerCausalLMOutputWithLogProbs so
@@ -2185,6 +2194,15 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         video_mask = kwargs.pop("video_mask")
         audio_mask = kwargs.pop("audio_mask")
         # --- Patch.1 ---
+
+        # --- Patch.7 ---
+        # Drain ``multimodal_metadata`` from kwargs even though qwen2_5_omni's
+        # ViT doesn't yet consume the precomputed cu_seqlens (window-attention
+        # layout; full integration deferred). Pops here prevent the dict from
+        # reaching downstream transformers code via ``**kwargs``.
+        # See .agents/knowledge/multimodal_metadata.md.
+        kwargs.pop("multimodal_metadata", None)
+        # --- Patch.7 ---
 
         # --- Patch.2 ---
         if self.training and get_parallel_state().sp_enabled:
@@ -2306,25 +2324,30 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
         logits = None
         log_probs = None
         entropy = None
+        distillation_losses = None
+        student_mass = None
+        teacher_mass = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss (chunked fused CE
             # when bound, falls back to ``self.loss_function`` otherwise).
             if veomni_causal_lm_loss.use_non_eager_impl:  # noqa: F821 — declared via add_post_import_block
-                loss, logits, log_probs, entropy = veomni_causal_lm_loss(  # noqa: F821
-                    logits=logits,
-                    labels=labels,
-                    vocab_size=self.config.get_text_config().vocab_size,
-                    hidden_states=hidden_states,
-                    weights=self.lm_head.weight,
-                    ignore_index=IGNORE_INDEX,
-                    **kwargs,
+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
+                    veomni_causal_lm_loss(  # noqa: F821
+                        logits=logits,
+                        labels=labels,
+                        vocab_size=self.config.get_text_config().vocab_size,
+                        hidden_states=hidden_states,
+                        weights=self.lm_head.weight,
+                        ignore_index=IGNORE_INDEX,
+                        **kwargs,
+                    )
                 )
             else:
                 logits = self.lm_head(hidden_states)
                 # Modification: VeOmni's patched ``loss_function`` (via
-                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy)``;
+                # LOSS_MAPPING) returns ``(loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass)``;
                 # unpack to match the OpSlot branch above.
-                loss, logits, log_probs, entropy = self.loss_function(
+                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.get_text_config().vocab_size,
@@ -2345,8 +2368,13 @@ class Qwen2_5OmniThinkerForConditionalGeneration(Qwen2_5OmniPreTrainedModelForCo
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             rope_deltas=self.rope_deltas,
-            log_probs=log_probs,
-            entropy=entropy,
+            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+                log_probs=log_probs,
+                entropy=entropy,
+                distillation_losses=distillation_losses,
+                student_mass=student_mass,
+                teacher_mass=teacher_mass,
+            ),
         )
         # --- Patch.7 ---
 
@@ -2463,7 +2491,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 # ======================================================================
 # [MODIFIED CLASS] Qwen2_5OmniForConditionalGeneration
-# Methods patched: __init__, enable_talker, generate, forward, get_position_id_func
+# Methods patched: __init__, enable_talker, generate, forward, get_position_id_func, get_extra_collate_infos
 # ======================================================================
 
 
@@ -2657,6 +2685,26 @@ class Qwen2_5OmniForConditionalGeneration(Qwen2_5OmniPreTrainedModel, Generation
     # ================================================================
     def get_position_id_func(self):
         return self.thinker.get_position_id_func()
+
+    # ================================================================
+    # Patch: Qwen2_5OmniForConditionalGeneration.get_extra_collate_infos (NEW)
+    # Declare the omni-specific collate rules (audio feature tensors) so the
+    # trainer doesn't hardcode them by model_type — the model owns its own
+    # modality-specific collate topology. Tuples are
+    # (pack_dim, sp_slice, sp_pad_value, sp_pad_scale); MainCollator coerces them.
+    #
+    # NOTE: qwen2_5_omni deliberately does NOT expose get_metadata_collate_func
+    # (its window-attention ViT is not yet wired — see multimodal_metadata.md).
+    # The transforms still emit image_grid_thw_list onto the batch; with no
+    # metadata hook it stays top-level (absorbed by the forward's **kwargs).
+    # This is intentional, not an oversight.
+    # ================================================================
+    def get_extra_collate_infos(self):
+        return {
+            "audio_feature_lengths": (0, False, None, None),
+            "input_features": (0, True, 0, 1),
+            "audio_mask": (-1, False, 0, 1),
+        }
 
 
 __all__ = [

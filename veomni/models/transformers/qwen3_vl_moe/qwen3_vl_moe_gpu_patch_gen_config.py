@@ -48,6 +48,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
     config as qwen3_vl_config,
 )
 from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
+    qwen3_vl_get_metadata_collate_func_patched,
     qwen3_vl_get_position_id_func_patched,
     qwen3_vl_model_get_image_features_patched,
     qwen3_vl_model_get_placeholder_mask_patched,
@@ -62,7 +63,7 @@ from veomni.models.transformers.qwen3_vl.qwen3_vl_gpu_patch_gen_config import (
 )
 from veomni.ops import fused_moe_forward
 from veomni.patchgen.patch_spec import PatchConfig
-from veomni.utils.model_outputs import Qwen3VLMoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3VLMoeCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -89,7 +90,10 @@ config.add_import("veomni.ops", names=["fused_moe_forward"])
 # would bypass ``ModelOutput`` pytree flattening, breaking FSDP2's pre-backward
 # unshard hook on ``lm_head`` and triggering ``setStorage … storage of size 0``
 # in ``chunk_logprobs.backward`` (parallels VeOmni #731's qwen3_5_moe fix).
-config.add_import("veomni.utils.model_outputs", names=["Qwen3VLMoeCausalLMOutputWithLogProbs"])
+config.add_import(
+    "veomni.utils.model_outputs",
+    names=["FusedLinearAuxOutput", "FusedLinearAuxOutputMixin", "Qwen3VLMoeCausalLMOutputWithLogProbs"],
+)
 config.drop_import_names("Qwen3VLMoeCausalLMOutputWithPast")
 
 config.add_post_import_block(
@@ -175,6 +179,12 @@ config.override_method(
     replacement=qwen3_vl_get_position_id_func_patched,
     name_map=_NAME_MAP,
     description="Use VeOmni precomputed position-id function and unified multimodal token ids",
+)
+config.override_method(
+    "Qwen3VLMoeForConditionalGeneration.get_metadata_collate_func",
+    replacement=qwen3_vl_get_metadata_collate_func_patched,
+    name_map=_NAME_MAP,
+    description="Expose CPU-side ViT multimodal-metadata derivation to the VeOmni collator",
 )
 
 
@@ -316,11 +326,33 @@ def qwen3_vl_moe_model_forward_patched(
         inputs_embeds = gather_outputs(inputs_embeds, gather_dim=1, group=get_parallel_state().sp_group)
     # --- Patch.1 ---
 
+    # --- Patch.6 ---
+    # Mirror of qwen3_vl: unpack per-modality ViT kwargs from
+    # `multimodal_metadata` (collator-precomputed) so the patched ViT
+    # forward can skip the in-forward .tolist() / cu_seqlens build.
+    # See .agents/knowledge/multimodal_metadata.md.
+    multimodal_metadata = kwargs.pop("multimodal_metadata", None) or {}
+    image_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("image_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_image_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_image_max_seqlen"),
+        }
+    }
+    video_vit_kwargs = {
+        "vit_metadata": {
+            "grid_thw_list": multimodal_metadata.get("video_grid_thw_list"),
+            "cu_seqlens": multimodal_metadata.get("vit_video_cu_seqlens"),
+            "max_seqlen": multimodal_metadata.get("vit_video_max_seqlen"),
+        }
+    }
+    # --- Patch.6 ---
+
     fake_deepstack = None
 
     if pixel_values is not None:
         image_outputs: BaseModelOutputWithDeepstackFeatures = self.get_image_features(
-            pixel_values, image_grid_thw, return_dict=True
+            pixel_values, image_grid_thw, return_dict=True, **image_vit_kwargs
         )
         image_embeds = image_outputs.pooler_output
         deepstack_image_embeds = image_outputs.deepstack_features
@@ -334,12 +366,12 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-        n_image_tokens = image_mask.sum().long().item()
         embeds_image_mask = (
             image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        image_embeds = image_embeds[:n_image_tokens]
-        deepstack_image_embeds = [embed[:n_image_tokens] for embed in deepstack_image_embeds]
+        # `masked_scatter` consumes exactly `image_mask.sum()` leading rows; data collator pads
+        # vision sequence only at the end. No `image_embeds[:n]` slice needed → no
+        # `image_mask.sum().item()` host-device sync. Same for the deepstack list.
         image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_image_mask, image_embeds)
 
@@ -370,7 +402,7 @@ def qwen3_vl_moe_model_forward_patched(
 
     if pixel_values_videos is not None:
         video_outputs: BaseModelOutputWithDeepstackFeatures = self.get_video_features(
-            pixel_values_videos, video_grid_thw, return_dict=True
+            pixel_values_videos, video_grid_thw, return_dict=True, **video_vit_kwargs
         )
         video_embeds = video_outputs.pooler_output
         deepstack_video_embeds = video_outputs.deepstack_features
@@ -384,12 +416,11 @@ def qwen3_vl_moe_model_forward_patched(
             ]
         # --- Patch.1 ---
 
-        n_video_tokens = video_mask.sum().long().item()
         embeds_video_mask = (
             video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device, non_blocking=True)
         )
-        video_embeds = video_embeds[:n_video_tokens]
-        deepstack_video_embeds = [embed[:n_video_tokens] for embed in deepstack_video_embeds]
+        # Same as image branch above: drop the `[:n_video_tokens]` slice + the
+        # `.item()` sync.
         video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
         inputs_embeds = inputs_embeds.masked_scatter(embeds_video_mask, video_embeds)
 
@@ -553,10 +584,13 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
     logits = None
     log_probs = None
     entropy = None
+    distillation_losses = None
+    student_mass = None
+    teacher_mass = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy = veomni_causal_lm_loss(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -567,9 +601,9 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy); unpack to match the
+            # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy = self.loss_function(
+            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -612,8 +646,13 @@ def qwen3_vl_moe_for_conditional_generation_forward_patched(
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
         router_logits=getattr(outputs, "router_logits", None),
-        log_probs=log_probs,
-        entropy=entropy,
+        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
+            log_probs=log_probs,
+            entropy=entropy,
+            distillation_losses=distillation_losses,
+            student_mass=student_mass,
+            teacher_mass=teacher_mass,
+        ),
     )
 
 
