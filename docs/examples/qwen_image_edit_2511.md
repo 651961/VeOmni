@@ -192,6 +192,43 @@ model:
 Setting `loss_outlier_threshold: null` (or removing the field) disables
 the mask entirely.
 
+### FFN learning-rate multiplier (on in the yaml)
+
+The feed-forward modules of every dual-stream block (`img_mlp` and
+`txt_mlp`, each a two-linear `QwenFeedForward`) are trained at **2x the
+base learning rate**; all other parameters stay at the base lr. This
+yaml turns it on:
+
+```yaml
+train:
+  optimizer:
+    lr: 1.0e-4
+    ffn_lr_mult: 2.0
+    ffn_lr_mult_modules: [img_mlp, txt_mlp]
+```
+
+- `ffn_lr_mult_modules` is matched as substrings against parameter
+  names; any param whose name contains one of the entries is moved into
+  a separate group with `lr = lr * ffn_lr_mult`. With the two entries
+  above this is `transformer_blocks.*.img_mlp.*` and `*.txt_mlp.*`
+  (4 params each, 60 blocks).
+- The lr ratio survives warmup and decay untouched: the scheduler is a
+  `LambdaLR` that scales every group from its own captured initial lr by
+  the same factor, so the 2x is preserved without any scheduler change.
+- Weight-decay grouping is reapplied per subset, so a populated
+  `no_decay_modules` / `no_decay_params` keeps working alongside the
+  multiplier.
+- `ffn_lr_mult: 1.0` (the field default) is a no-op and falls back to
+  the standard single-lr optimizer; the override lives in
+  `veomni/trainer/dit_trainer.py:_build_optimizer`. Not supported with
+  `optimizer.type: muon` (logs a warning and ignores the multiplier).
+
+A startup log line confirms the split, e.g.
+`FFN lr override: <N> params matching ['img_mlp', 'txt_mlp'] use
+lr=0.0002 (2.0x base); <M> params use lr=0.0001.` The matched set
+includes block 59's structurally-dead `txt_mlp` (see §5) — harmless,
+since those params never receive gradient regardless of their lr.
+
 ---
 
 ## 3.3 Performance defaults (on in the yaml)

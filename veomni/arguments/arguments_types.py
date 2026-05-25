@@ -91,6 +91,24 @@ class OptimizerConfig:
         default_factory=list,
         metadata={"help": "Parameters without weight decay, for example, bias."},
     )
+    ffn_lr_mult: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Learning-rate multiplier for the modules listed in ffn_lr_mult_modules. "
+                "1.0 (default) keeps every parameter on the same lr."
+            )
+        },
+    )
+    ffn_lr_mult_modules: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Substrings matched against parameter names; matched params form a separate "
+                "group whose lr is scaled by ffn_lr_mult, for example ['img_mlp', 'txt_mlp']."
+            )
+        },
+    )
     max_grad_norm: float = field(
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},

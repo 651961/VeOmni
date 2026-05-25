@@ -34,6 +34,8 @@ from ..models import build_foundation_model
 from ..models.auto import build_config
 from ..models.loader import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY
 from ..ops import apply_ops_config
+from ..optim import build_optimizer
+from ..optim.optimizer import _make_param_groups_for_subset
 from ..utils import helper
 from ..utils.device import (
     get_device_type,
@@ -207,7 +209,7 @@ class DiTTrainer:
         if self.training_task != "offline_embedding":
             self.base._build_parallelized_model()
             self._maybe_compile_mlps()
-            self.base._build_optimizer()
+            self._build_optimizer()
             self.base._build_lr_scheduler()
             self.base._build_training_context()
 
@@ -228,6 +230,69 @@ class DiTTrainer:
         for i in range(len(blocks)):
             blocks[i] = torch.compile(blocks[i])
         logger.info_rank0(f"Compiled {len(blocks)} transformer_blocks (whole block).")
+
+    def _build_optimizer(self):
+        # Optionally give the FFN/MLP modules a scaled learning rate.  When
+        # ffn_lr_mult == 1.0 or no module is listed, fall back to BaseTrainer so
+        # behaviour is identical to the default path.  build_lr_scheduler uses
+        # LambdaLR, which scales each param group from its own initial lr, so the
+        # multiplier is preserved through warmup/decay without touching the scheduler.
+        opt_cfg = self.base.args.train.optimizer
+        ffn_lr_mult = opt_cfg.ffn_lr_mult
+        ffn_modules = opt_cfg.ffn_lr_mult_modules
+        if opt_cfg.type == "muon":
+            if ffn_lr_mult != 1.0 and ffn_modules:
+                logger.warning_rank0("ffn_lr_mult is ignored for optimizer_type='muon'; using the default lr.")
+            self.base._build_optimizer()
+            return
+        if ffn_lr_mult == 1.0 or not ffn_modules:
+            self.base._build_optimizer()
+            return
+
+        model = self.base.model
+        ffn_params, other_params = [], []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(m in name for m in ffn_modules):
+                ffn_params.append(p)
+            else:
+                other_params.append(p)
+
+        if not ffn_params:
+            logger.warning_rank0(f"ffn_lr_mult_modules={ffn_modules} matched no parameters; using the default lr.")
+            self.base._build_optimizer()
+            return
+
+        # Reuse the shared decay/no-decay splitter for each subset, then tag the
+        # FFN groups with the scaled lr.  All other groups keep the base lr.
+        base_lr = opt_cfg.lr
+        param_groups = []
+        for group in _make_param_groups_for_subset(
+            model, ffn_params, opt_cfg.weight_decay, opt_cfg.no_decay_modules, opt_cfg.no_decay_params
+        ):
+            group["lr"] = base_lr * ffn_lr_mult
+            param_groups.append(group)
+        for group in _make_param_groups_for_subset(
+            model, other_params, opt_cfg.weight_decay, opt_cfg.no_decay_modules, opt_cfg.no_decay_params
+        ):
+            group["lr"] = base_lr
+            param_groups.append(group)
+
+        logger.info_rank0(
+            f"FFN lr override: {len(ffn_params)} params matching {ffn_modules} use "
+            f"lr={base_lr * ffn_lr_mult:g} ({ffn_lr_mult}x base); {len(other_params)} params use lr={base_lr:g}."
+        )
+        self.base.optimizer = build_optimizer(
+            model,
+            lr=base_lr,
+            weight_decay=opt_cfg.weight_decay,
+            fused=True,
+            optimizer_type=opt_cfg.type,
+            param_groups=param_groups,
+            no_decay_modules=opt_cfg.no_decay_modules,
+            no_decay_params=opt_cfg.no_decay_params,
+        )
 
     def _setup(self):
         self.base._setup()

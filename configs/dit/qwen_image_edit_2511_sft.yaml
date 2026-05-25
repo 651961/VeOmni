@@ -1,15 +1,3 @@
-# Qwen-Image-Edit-2511 SFT config.
-#
-# Same yaml drives two modes via train.training_task:
-#   - offline_embedding : 一次性把 VAE latents + prompt embedding 写进 parquet
-#   - offline_training  : 训练时从 parquet cache 直接读 embedding（无 VAE/text encoder）
-#
-# (online_training 本期不实现 — raw PIL → vae-sized PIL resize 链与参照实现
-#  尚未对齐，对齐成本高于收益。)
-#
-# Field defaults are tuned for full-parameter SFT on a single 8×80GB node;
-# CLI overrides (e.g. --train.global_batch_size 8) apply on top.
-
 model:
   config_path: /models/Qwen-Image-Edit-2511/transformer
   model_path: /models/Qwen-Image-Edit-2511/transformer
@@ -76,7 +64,9 @@ train:
     lr_warmup_ratio: 0.025
     lr_decay_style: constant
     weight_decay: 0.001
-    max_grad_norm: 1.0
+    ffn_lr_mult: 2.0
+    ffn_lr_mult_modules: [img_mlp, txt_mlp]
+    max_grad_norm: 0.5
   checkpoint:
     output_dir: /path/to/checkpoints/qwen_image_edit_2511_runs
     save_async: true
