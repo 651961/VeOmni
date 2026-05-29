@@ -57,7 +57,7 @@ from veomni.distributed.sequence_parallel.async_ulysses import (
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import IS_NPU_AVAILABLE
-from veomni.utils.model_outputs import FusedLinearAuxOutput, Qwen3VLCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import Qwen3VLCausalLMOutputWithLogProbs
 
 
 config = PatchConfig(
@@ -112,9 +112,74 @@ config.add_post_import_block(
     # ── OpSlot declarations ──────────────────────────────────────────────────
     # Bound at model-build time by _bind_veomni_ops() in auto.py.
     from veomni.ops.dispatch import OpSlot
+    veomni_rms_norm = OpSlot("rms_norm", "standard")
     veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
+    veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "full")
+    veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
     """
 )
+
+
+# ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+
+
+@config.override_method(
+    "Qwen3VLTextRMSNorm.forward",
+    description="OpSlot guard for Liger fused RMSNorm (standard formulation)",
+)
+def qwen3_vl_rmsnorm_forward_patched(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+    if veomni_rms_norm.use_non_eager_impl:
+        return veomni_rms_norm(hidden_states, self.weight, self.variance_epsilon)
+    # Original HF code below, unchanged.
+    input_dtype = hidden_states.dtype
+    hidden_states = hidden_states.to(torch.float32)
+    variance = hidden_states.pow(2).mean(-1, keepdim=True)
+    hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+    return self.weight * hidden_states.to(input_dtype)
+
+
+# ── Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+
+
+@config.replace_function("apply_rotary_pos_emb", description="OpSlot guard for Liger fused RoPE")
+def apply_rotary_pos_emb_patched(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    unsqueeze_dim: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Modification: OpSlot guard — use fused RoPE kernel when bound.
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+    # Original HF code below, unchanged.
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+# ── Vision Rotary Positional Embedding (OpSlot guard) ───────────────────────────────
+
+
+@config.replace_function(
+    "apply_rotary_pos_emb_vision",
+    description="OpSlot guard for Liger fused vision RoPE",
+)
+def apply_rotary_pos_emb_vision_patched(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
+    return q_embed, k_embed
 
 
 # ================================================================
@@ -1302,15 +1367,11 @@ def qwen3_vl_for_conditional_generation_forward_patched(
     # --- Patch.1 ---
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
-    distillation_losses = None
-    student_mass = None
-    teacher_mass = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1320,7 +1381,7 @@ def qwen3_vl_for_conditional_generation_forward_patched(
             )
         else:
             logits = self.lm_head(hidden_states)
-            loss, _, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1328,8 +1389,8 @@ def qwen3_vl_for_conditional_generation_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
-            if log_probs is not None:
-                # log_probs path empties loss/logits slots; clear the local 3D
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
                 # logits so output mirrors the OpSlot branch's contract.
                 logits = None
     else:
@@ -1343,11 +1404,5 @@ def qwen3_vl_for_conditional_generation_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         rope_deltas=outputs.rope_deltas,
-        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
-        ),
+        fused_linear_aux=fused_linear_aux,
     )

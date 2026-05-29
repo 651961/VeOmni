@@ -68,7 +68,7 @@ from veomni.models.transformers.qwen3_5.qwen3_5_gpu_patch_gen_config import (
 )
 from veomni.patchgen.patch_spec import PatchConfig
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
-from veomni.utils.model_outputs import FusedLinearAuxOutput, FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -86,7 +86,6 @@ config.add_import("functools", names=["partial"])
 config.add_import("types", names=["SimpleNamespace"])
 config.add_import("torch.distributed", alias="dist", is_from_import=False)
 config.add_import("veomni.distributed.parallel_state", names=["get_parallel_state"])
-config.add_import("veomni.ops", names=["fused_moe_forward"])
 config.add_import("veomni.utils.device", names=["get_device_id"])
 config.add_import(
     "veomni.distributed.sequence_parallel.ulysses",
@@ -548,10 +547,11 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
         The rope index difference between sequence length and multimodal rope.
-    log_probs (`torch.FloatTensor`, *optional*):
-        Per-token log probabilities returned by VeOmni's fused loss path.
-    entropy (`torch.FloatTensor`, *optional*):
-        Per-token softmax entropy returned by VeOmni's fused loss path.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path
+        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
 
@@ -860,15 +860,11 @@ def qwen3_5_moe_forcausallm_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
-    distillation_losses = None
-    student_mass = None
-    teacher_mass = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -879,9 +875,9 @@ def qwen3_5_moe_forcausallm_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
@@ -889,6 +885,10 @@ def qwen3_5_moe_forcausallm_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
 
@@ -920,13 +920,7 @@ def qwen3_5_moe_forcausallm_forward_patched(
         hidden_states=outputs.hidden_states,
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
-        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
-        ),
+        fused_linear_aux=fused_linear_aux,
     )
 
 
@@ -974,15 +968,11 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
 
     loss = None
     logits = None
-    log_probs = None
-    entropy = None
-    distillation_losses = None
-    student_mass = None
-    teacher_mass = None
+    fused_linear_aux = None
     if labels is not None:
         # Modification: OpSlot guard for cross-entropy loss.
         if veomni_causal_lm_loss.use_non_eager_impl:
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = veomni_causal_lm_loss(
+            loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -993,9 +983,9 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         else:
             logits = self.lm_head(hidden_states)
             # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-            # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
+            # returns (loss, logits, fused_linear_aux); unpack to match the
             # OpSlot branch above.
-            loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+            loss, _, fused_linear_aux = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.text_config.vocab_size,
@@ -1003,6 +993,10 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
                 weights=self.lm_head.weight,
                 **kwargs,
             )
+            if fused_linear_aux is not None:
+                # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                # logits so output mirrors the OpSlot branch's contract.
+                logits = None
     else:
         logits = self.lm_head(hidden_states)
 
@@ -1035,13 +1029,7 @@ def qwen3_5_moe_forconditional_generation_forward_patched(
         attentions=outputs.attentions,
         router_logits=outputs.router_logits,
         rope_deltas=outputs.rope_deltas,
-        fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-            log_probs=log_probs,
-            entropy=entropy,
-            distillation_losses=distillation_losses,
-            student_mass=student_mass,
-            teacher_mass=teacher_mass,
-        ),
+        fused_linear_aux=fused_linear_aux,
     )
 
 

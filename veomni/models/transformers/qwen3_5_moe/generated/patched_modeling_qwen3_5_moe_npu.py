@@ -11,8 +11,6 @@
 #  Patches applied:
 #    - method_override: Qwen3_5MoeRMSNorm.forward
 #      Use fused rmsnorm to impl zero-centered rmsnorm (1+weight centered formulation)
-#    - method_override: Qwen3_5MoeRMSNormGated.forward
-#      Use fused rmsnorm and fused swiglu to impl gated rmsnorm
 #    - function_replacement: apply_rotary_pos_emb
 #      Use fused rope to impl partial rotary postion embedding
 #    - function_replacement: apply_rotary_pos_emb_vision
@@ -73,7 +71,6 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from torch_npu import torch_npu
 from transformers import initialization as init
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
@@ -105,7 +102,7 @@ from veomni.distributed.sequence_parallel import gather_outputs, slice_input_ten
 from veomni.distributed.sequence_parallel.ulysses import gather_heads_scatter_seq, gather_seq_scatter_heads
 from veomni.utils.constants import IMAGE_INPUT_INDEX, VIDEO_INPUT_INDEX
 from veomni.utils.device import get_device_id
-from veomni.utils.model_outputs import FusedLinearAuxOutput, FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
+from veomni.utils.model_outputs import FusedLinearAuxOutputMixin, MoeCausalLMOutputWithLogProbs
 from veomni.utils.moe_router_replay import get_active_replay, maybe_replay_indices
 
 
@@ -127,6 +124,9 @@ fused_recurrent_gated_delta_rule = None
 from veomni.ops.dispatch import OpSlot
 
 
+veomni_rms_norm = OpSlot("rms_norm", "qwen3_5")
+veomni_apply_rotary_pos_emb = OpSlot("rotary_pos_emb", "partial")
+veomni_apply_rotary_pos_emb_vision = OpSlot("rotary_pos_emb_vision", "full")
 veomni_moe_experts_forward = OpSlot("moe_experts", "standard")
 veomni_causal_lm_loss = OpSlot("cross_entropy_loss", "causal")
 veomni_load_balancing_loss = OpSlot("load_balancing_loss", "standard")
@@ -377,12 +377,6 @@ class Qwen3_5MoeDynamicCache:
         return self.conv_states[self.last_linear_layer] is not None
 
 
-# ======================================================================
-# [MODIFIED CLASS] Qwen3_5MoeRMSNormGated
-# Methods patched: forward
-# ======================================================================
-
-
 class Qwen3_5MoeRMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
@@ -390,11 +384,15 @@ class Qwen3_5MoeRMSNormGated(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states, gate=None):
-        hidden_states = torch_npu.npu_rms_norm(hidden_states, self.weight, self.variance_epsilon)[0]
-        hidden_states = torch.cat([gate, hidden_states], dim=-1)
-        hidden_states = torch_npu.npu_swiglu(hidden_states, dim=-1)
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
 
-        return hidden_states
+        return hidden_states.to(input_dtype)
 
 
 def apply_mask_to_padding_states(hidden_states, attention_mask):
@@ -861,6 +859,8 @@ def rotate_half(x):
 # Source: veomni.models.transformers.qwen3_5.qwen3_5_npu_patch_gen_config
 # ======================================================================
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    if veomni_apply_rotary_pos_emb.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
 
@@ -869,8 +869,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
     k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
 
-    q_embed = torch_npu.npu_rotary_mul(q_rot, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k_rot, cos, sin)
+    # Apply rotary embeddings on the first half or full tensor
+    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
+    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
 
     # Concatenate back to full shape
     q_embed = torch.cat([q_embed, q_pass], dim=-1)
@@ -1162,8 +1163,21 @@ class Qwen3_5MoeRMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    # ── RMSNorm (OpSlot guard, functional Liger kernel) ──────────────────────────
+    # Mirrors qwen3_5_moe's pattern: the slot binds to liger_rms_norm_qwen3_5
+    # (registered for variant="qwen3_5") when rms_norm_implementation="liger_kernel"
+    # and falls through to the original HF code otherwise. Replaces the previous
+    # unconditional class swap to LigerRMSNormForQwen3Next so eager mode is honoured.
     def forward(self, x):
-        return torch_npu.npu_rms_norm(x, 1.0 + self.weight, self.eps)[0]
+        # Modification: OpSlot guard — use fused RMSNorm kernel when bound.
+        if veomni_rms_norm.use_non_eager_impl:
+            return veomni_rms_norm(x, self.weight, self.eps)
+        # Original HF code below, unchanged.
+        output = self._norm(x.float())
+        # Llama does x.to(float16) * w whilst Qwen3_5 is (x * w).to(float16)
+        # See https://github.com/huggingface/transformers/pull/29402
+        output = output * (1.0 + self.weight.float())
+        return output.type_as(x)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"
@@ -1337,12 +1351,16 @@ class Qwen3_5MoeVisionPatchMerger(nn.Module):
 def apply_rotary_pos_emb_vision(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q, k = q.unsqueeze(0), k.unsqueeze(0)
-    cos = cos.unsqueeze(0).unsqueeze(2).float()
-    sin = sin.unsqueeze(0).unsqueeze(2).float()
-    q_embed = torch_npu.npu_rotary_mul(q, cos, sin)
-    k_embed = torch_npu.npu_rotary_mul(k, cos, sin)
-    q_embed, k_embed = q_embed.squeeze(0), k_embed.squeeze(0)
+    if veomni_apply_rotary_pos_emb_vision.use_non_eager_impl:
+        return veomni_apply_rotary_pos_emb_vision(q, k, cos, sin)
+    orig_q_dtype = q.dtype
+    orig_k_dtype = k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    q_embed = q_embed.to(orig_q_dtype)
+    k_embed = k_embed.to(orig_k_dtype)
     return q_embed, k_embed
 
 
@@ -1891,10 +1909,11 @@ class Qwen3_5MoeCausalLMOutputWithLogProbs(FusedLinearAuxOutputMixin, Qwen3_5Moe
         Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
     rope_deltas (`torch.LongTensor` of shape `(batch_size, )`, *optional*):
         The rope index difference between sequence length and multimodal rope.
-    log_probs (`torch.FloatTensor`, *optional*):
-        Per-token log probabilities returned by VeOmni's fused loss path.
-    entropy (`torch.FloatTensor`, *optional*):
-        Per-token softmax entropy returned by VeOmni's fused loss path.
+    fused_linear_aux (`FusedLinearAuxOutput`, *optional*):
+        Per-token tensors produced by the fused-linear loss path
+        (``log_probs`` / ``entropy``; plus ``distillation_losses`` /
+        ``student_mass`` / ``teacher_mass`` on the top-k distillation path).
+        ``None`` on the plain loss path; populated when ``return_log_probs=True``.
     """
 
 
@@ -2643,30 +2662,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
-                # OpSlot branch above.
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.vocab_size,
@@ -2674,6 +2674,23 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
+            else:
+                logits = self.lm_head(hidden_states)
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits, fused_linear_aux); unpack to match the
+                # OpSlot branch above.
+                loss, _, fused_linear_aux = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+                if fused_linear_aux is not None:
+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
 
@@ -2705,13 +2722,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
 
 
@@ -2812,30 +2823,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
 
         loss = None
         logits = None
-        log_probs = None
-        entropy = None
-        distillation_losses = None
-        student_mass = None
-        teacher_mass = None
+        fused_linear_aux = None
         if labels is not None:
             # Modification: OpSlot guard for cross-entropy loss.
             if veomni_causal_lm_loss.use_non_eager_impl:
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = (
-                    veomni_causal_lm_loss(
-                        logits=logits,
-                        labels=labels,
-                        vocab_size=self.config.text_config.vocab_size,
-                        hidden_states=hidden_states,
-                        weights=self.lm_head.weight,
-                        **kwargs,
-                    )
-                )
-            else:
-                logits = self.lm_head(hidden_states)
-                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
-                # returns (loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass); unpack to match the
-                # OpSlot branch above.
-                loss, logits, log_probs, entropy, distillation_losses, student_mass, teacher_mass = self.loss_function(
+                loss, logits, fused_linear_aux = veomni_causal_lm_loss(
                     logits=logits,
                     labels=labels,
                     vocab_size=self.config.text_config.vocab_size,
@@ -2843,6 +2835,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
                     weights=self.lm_head.weight,
                     **kwargs,
                 )
+            else:
+                logits = self.lm_head(hidden_states)
+                # Modification: VeOmni's patched `loss_function` (via LOSS_MAPPING)
+                # returns (loss, logits, fused_linear_aux); unpack to match the
+                # OpSlot branch above.
+                loss, _, fused_linear_aux = self.loss_function(
+                    logits=logits,
+                    labels=labels,
+                    vocab_size=self.config.text_config.vocab_size,
+                    hidden_states=hidden_states,
+                    weights=self.lm_head.weight,
+                    **kwargs,
+                )
+                if fused_linear_aux is not None:
+                    # fused_linear_aux path empties loss/logits slots; clear the local 3D
+                    # logits so output mirrors the OpSlot branch's contract.
+                    logits = None
         else:
             logits = self.lm_head(hidden_states)
 
@@ -2875,13 +2884,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel, GenerationMi
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
             rope_deltas=outputs.rope_deltas,
-            fused_linear_aux=FusedLinearAuxOutput.from_loss_slots(
-                log_probs=log_probs,
-                entropy=entropy,
-                distillation_losses=distillation_losses,
-                student_mass=student_mass,
-                teacher_mass=teacher_mass,
-            ),
+            fused_linear_aux=fused_linear_aux,
         )
 
     def prepare_inputs_for_generation(
