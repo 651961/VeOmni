@@ -51,8 +51,8 @@ train:
   gradient_checkpointing:
     enable: true
     sac_policy: none
-  enable_compile: false
-  global_batch_size: 64
+  enable_compile: true
+  global_batch_size: 128
   micro_batch_size: 1
   init_device: meta
   num_train_epochs: 80
@@ -66,7 +66,7 @@ train:
     weight_decay: 0.001
     ffn_lr_mult: 2.0
     ffn_lr_mult_modules: [img_mlp, txt_mlp]
-    max_grad_norm: 0.5
+    max_grad_norm: 0.2
   checkpoint:
     output_dir: /path/to/checkpoints/qwen_image_edit_2511_runs
     save_async: true
