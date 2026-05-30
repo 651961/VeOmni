@@ -64,11 +64,20 @@ class MappingDataset(Dataset):
         if index >= len(self.indices):
             random.shuffle(self.indices)
             index = index % len(self.indices)
-        mapped_idx = self.indices[index]
-        if self._transform is not None:
-            return self._transform(self._data[mapped_idx])
-        else:
-            return self._data[mapped_idx]
+        if self._transform is None:
+            return self._data[self.indices[index]]
+        # Skip corrupt samples (e.g. a truncated image that PIL refuses to
+        # decode) by advancing to the next sample, so a single bad row cannot
+        # crash the dataloader worker and abort the run.
+        num = len(self.indices)
+        for offset in range(num):
+            cur = self.indices[(index + offset) % num]
+            try:
+                return self._transform(self._data[cur])
+            except Exception as e:
+                logger.warning(f"Skipping corrupt sample at index {cur}: {e!r}")
+                continue
+        raise RuntimeError(f"All {num} samples failed to transform.")
 
 
 class IterativeDataset(IterableDataset):
