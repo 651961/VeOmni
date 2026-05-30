@@ -93,6 +93,7 @@ bash train.sh tasks/train_dit.py \
     --train.accelerator.ulysses_size 1 \
     --train.num_train_epochs 1 \
     --train.wandb.enable false \
+    --train.checkpoint.save_steps 0 \
     --train.checkpoint.output_dir /path/to/checkpoints/qwen_image_edit_2511_runs
 ```
 
