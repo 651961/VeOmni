@@ -97,6 +97,13 @@ bash train.sh tasks/train_dit.py \
     --train.checkpoint.output_dir /path/to/checkpoints/qwen_image_edit_2511_runs
 ```
 
+> **`--train.checkpoint.save_steps 0` is required for this stage.** The
+> `offline_embedding` task only runs the condition model to encode samples
+> and dump embeddings to parquet — the DiT is never trained, so there is no
+> meaningful model state to checkpoint. Leaving `save_steps > 0` here wastes
+> time (and disk) writing DCP shards of an untrained model. Set it back to
+> `1000` (or your cadence) only for the `offline_training` stage in §3.2.
+
 Each output row stores four pickled tensors:
 
 | Column            | Shape                                  | Description                                                              |
@@ -299,14 +306,14 @@ Caveats:
 Training writes distributed `.distcp` shards to
 `<output_dir>/checkpoints/global_step_<N>/`. To get a single-process
 `safetensors` checkpoint that drops in at the `transformer/` subfolder
-of an upstream model directory, merge with `scripts/merge_dcp_to_hf.py`:
+of an upstream model directory, merge with `scripts/merge_dcp_to_diffusers.py`:
 
 ```shell
-python scripts/merge_dcp_to_hf.py \
+python scripts/merge_dcp_to_diffusers.py \
+    --shard-size 10000000000 \
     --load-dir /path/to/checkpoints/qwen_image_edit_2511_runs/checkpoints/global_step_1000 \
-    --save-dir /path/to/checkpoints/qwen_image_edit_2511_runs/checkpoints/global_step_1000/hf_ckpt \
-    --model-assets-dir /models/Qwen-Image-Edit-2511/transformer \
-    --shard-size 10000000000
+    --save-dir /path/to/checkpoints/qwen_image_edit_2511_runs/checkpoints/global_step_1000/diffusers_ckpt \
+    --config-path /models/Qwen-Image-Edit-2511/transformer
 ```
 
 `--shard-size 10000000000` (10 GB) matches the upstream Qwen-Image-Edit-2511
