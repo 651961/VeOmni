@@ -8,13 +8,12 @@ from typing import Optional, Union
 
 import torch
 from safetensors.torch import save_file
-from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint import FileSystemReader, load
 from torch.distributed.checkpoint.metadata import Metadata
 
 from veomni.checkpoint.dcp_checkpointer import (
     _get_sharding_plan,
     _normalize_key,
-    _process_shard,
     get_dtype_size,
 )
 from veomni.utils import helper
@@ -29,6 +28,130 @@ WEIGHTS_INDEX_NAME = "diffusion_pytorch_model.bin.index.json"
 
 
 logger = helper.create_logger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Fused-QKV -> split-QKV export support.
+#
+# When the model is trained with ``config.fused_qkv=True`` the DCP checkpoint
+# stores one fused projection per stream:
+#     ...attn.to_qkv.{weight,bias}        = cat([q, k, v], dim=0)   [3*D_a, D_a]
+#     ...attn.to_added_qkv.{weight,bias}  = cat([q, k, v], dim=0)   [3*D_b, D_b]
+# The released diffusers checkpoint uses separate q/k/v projections, so on the
+# way out each fused tensor is split back into three keys (chunk(3, dim=0), the
+# same [q, k, v] order ``QwenImageEditFuseQKVConverter`` packs at load time).
+# When ``fused_qkv=False`` the DCP already holds split keys and none of this
+# triggers -- output is byte-identical to the previous behaviour.
+# --------------------------------------------------------------------------- #
+
+# Fused attn projection name -> the three diffusers split names it expands to.
+_FUSED_QKV_SPLIT = {
+    "to_qkv": ("to_q", "to_k", "to_v"),
+    "to_added_qkv": ("add_q_proj", "add_k_proj", "add_v_proj"),
+}
+
+
+def _maybe_split_targets(hf_key: str):
+    """If ``hf_key`` is a fused attn qkv weight/bias, return the three
+    ``(split_hf_key, chunk_index)`` targets it expands to; else ``None``."""
+    for fused, splits in _FUSED_QKV_SPLIT.items():
+        for param in ("weight", "bias"):
+            suffix = f".attn.{fused}.{param}"
+            if hf_key.endswith(suffix):
+                prefix = hf_key[: -len(suffix)]
+                return [(f"{prefix}.attn.{name}.{param}", idx) for idx, name in enumerate(splits)]
+    return None
+
+
+def _expand_fused_in_shard(shard: "OrderedDict[str, str]") -> "OrderedDict[str, object]":
+    """Expand any fused-qkv ``hf_key -> dcp_key`` entry into three split entries,
+    each carrying a ``(dcp_key, chunk_index)`` slice descriptor. Plain entries
+    pass through unchanged. Used on the size-based fallback plan (the
+    reference-index plan expands inline while building the routing table)."""
+    expanded: "OrderedDict[str, object]" = OrderedDict()
+    for hf_key, dcp_key in shard.items():
+        targets = _maybe_split_targets(hf_key)
+        if targets is None:
+            expanded[hf_key] = dcp_key
+        else:
+            for split_key, idx in targets:
+                expanded[split_key] = (dcp_key, idx)
+    return expanded
+
+
+@torch.no_grad()
+def _process_shard_split_aware(
+    shard_keys: "OrderedDict[str, object]",
+    checkpoint_path: str,
+    save_dtype: Optional[Union[str, torch.dtype]] = None,
+) -> "OrderedDict[str, torch.Tensor]":
+    """Materialize one output shard.
+
+    ``shard_keys`` maps each output ``hf_key`` to either a plain DCP key (whole
+    tensor) or a ``(dcp_key, chunk_index)`` descriptor that slices
+    ``chunk(3, dim=0)[chunk_index]`` out of a fused to_qkv / to_added_qkv
+    tensor.  A fused tensor referenced by several split keys is loaded once.
+
+    Mirrors ``dcp_checkpointer._process_shard`` for the plain-key case, so
+    behaviour is unchanged when no descriptors are present.
+    """
+    reader = FileSystemReader(checkpoint_path)
+    metadata = reader.read_metadata()
+
+    # Unique underlying DCP tensors to materialize (dedupe fused keys shared by
+    # the three split outputs).
+    underlying = OrderedDict()
+    for value in shard_keys.values():
+        dcp_key = value[0] if isinstance(value, tuple) else value
+        underlying[dcp_key] = None
+
+    state_dict = OrderedDict()
+    for dcp_key in underlying:
+        tensor_metadata = metadata.state_dict_metadata[dcp_key]
+        if not hasattr(tensor_metadata.properties, "dtype"):
+            raise ValueError(
+                f"Cannot determine dtype for tensor '{dcp_key}': metadata does not contain dtype information"
+            )
+        state_dict[dcp_key] = torch.empty(tensor_metadata.size, dtype=tensor_metadata.properties.dtype)
+
+    load(
+        state_dict,
+        checkpoint_id=checkpoint_path,
+        storage_reader=FileSystemReader(checkpoint_path),
+        no_dist=True,
+    )
+
+    target_dtype = None
+    if save_dtype:
+        target_dtype = getattr(torch, save_dtype) if isinstance(save_dtype, str) else save_dtype
+
+    processed_dict = OrderedDict()
+    for hf_key, value in shard_keys.items():
+        if isinstance(value, tuple):
+            dcp_key, chunk_index = value
+            tensor = state_dict[dcp_key]
+            if hasattr(tensor, "full_tensor"):
+                tensor = tensor.full_tensor()
+            tensor = tensor.chunk(3, dim=0)[chunk_index]
+        else:
+            tensor = state_dict[value]
+            if hasattr(tensor, "full_tensor"):
+                tensor = tensor.full_tensor()
+
+        if target_dtype:
+            tensor = tensor.to(dtype=target_dtype)
+
+        # .clone() also makes the chunk slice contiguous (safetensors requires it).
+        processed_dict[hf_key] = tensor.cpu().detach().clone()
+        del tensor
+
+    del state_dict
+    del metadata
+    del reader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return processed_dict
 
 
 def _get_sharding_plan_from_index(
@@ -79,8 +202,17 @@ def _get_sharding_plan_from_index(
             numel *= dim
         byte_size = numel * get_dtype_size(dtype)
 
-        hf_to_dcp[hf_key] = key
-        hf_to_size[hf_key] = byte_size
+        # A fused to_qkv / to_added_qkv tensor is exposed under its three
+        # diffusers split names (each a chunk(3, dim=0) slice) so it matches the
+        # reference index, which carries the released split layout.
+        split_targets = _maybe_split_targets(hf_key)
+        if split_targets is not None:
+            for split_key, idx in split_targets:
+                hf_to_dcp[split_key] = (key, idx)
+                hf_to_size[split_key] = byte_size // 3
+        else:
+            hf_to_dcp[hf_key] = key
+            hf_to_size[hf_key] = byte_size
         all_dcp_keys.append(key)
 
     # Load the reference weight_map.
@@ -165,6 +297,12 @@ def save_model_weights(
     else:
         logger.info("Analyzing DCP metadata and planning shards by size...")
         shards, total_size, all_dcp_keys = _get_sharding_plan(checkpoint_path, shard_size, save_dtype)
+        # Expand fused to_qkv / to_added_qkv entries into split slice descriptors
+        # (the reference-index path expands inline above).
+        if isinstance(shards, dict):
+            shards = _expand_fused_in_shard(shards)
+        else:
+            shards = [_expand_fused_in_shard(s) for s in shards]
         shard_filenames = None  # generated below from shard_idx
 
     logger.info(f"Found {len(all_dcp_keys)} model tensors, total size: ~{total_size / 1e9:.2f}GB")
@@ -192,7 +330,7 @@ def save_model_weights(
         save_path = os.path.join(output_dir, filename)
         logger.info(f"Processing shard {shard_idx + 1}/{num_shards}: {filename} ({len(shard_keys)} tensors)")
 
-        processed_dict = _process_shard(shard_keys, checkpoint_path, save_dtype)
+        processed_dict = _process_shard_split_aware(shard_keys, checkpoint_path, save_dtype)
 
         # Save shard
         if safe_serialization:

@@ -62,6 +62,7 @@ class QwenImageEditTransformerModelConfig(PretrainedConfig):
         guidance_embeds: bool = False,
         zero_cond_t: bool = True,
         loss_outlier_threshold: Optional[float] = None,
+        fused_qkv: bool = True,
         **kwargs,
     ):
         self.patch_size = patch_size
@@ -75,4 +76,13 @@ class QwenImageEditTransformerModelConfig(PretrainedConfig):
         self.guidance_embeds = guidance_embeds
         self.zero_cond_t = zero_cond_t
         self.loss_outlier_threshold = loss_outlier_threshold
+        # When True each stream's Q/K/V projection is a single fused GEMM
+        # (``to_qkv`` for image, ``to_added_qkv`` for text) instead of three
+        # separate ``nn.Linear`` calls -- fewer kernel launches and better
+        # tensor-core utilisation in both forward and backward. The released
+        # checkpoint's separate ``to_q/to_k/to_v`` (and ``add_{q,k,v}_proj``)
+        # weights are merged into the fused weight at load time by
+        # ``QwenImageEditFuseQKVConverter``. Set False to restore the original
+        # split projections (e.g. for numerical-alignment debugging).
+        self.fused_qkv = fused_qkv
         super().__init__(**kwargs)

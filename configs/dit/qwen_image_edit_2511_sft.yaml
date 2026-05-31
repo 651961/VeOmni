@@ -8,6 +8,14 @@ model:
     # mean. Off by default (null); set e.g. 50.0 if you see gradient norm
     # spikes traceable to a handful of exploding elements.
     loss_outlier_threshold: null
+    # Fuse each stream's Q/K/V projection into a single GEMM (to_qkv /
+    # to_added_qkv) for faster fwd+bwd. The released split q/k/v weights are
+    # merged at load time and split back when exporting via
+    # scripts/merge_dcp_to_diffusers.py, so this is transparent end-to-end.
+    # Set false to train with the original split projections (e.g. for
+    # numerical-alignment debugging). NOTE: with LoRA, fused changes the
+    # attention target_modules to [to_qkv, to_added_qkv].
+    fused_qkv: true
   # condition_model_cfg drives preprocessing scalars consumed by the
   # condition model (VAE + text encoder) and the DiT's zero-cond branch.
   # Two distinct image-area knobs:

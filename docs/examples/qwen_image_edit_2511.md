@@ -299,6 +299,40 @@ Caveats:
 - **`max-autotune-no-cudagraphs`** has been measured slower than the
   default mode on this model — keep the default.
 
+### Fused QKV projection (on in the yaml)
+
+`model.model_config.fused_qkv: true`. Each dual-stream block has two
+attention projection sets — image (`to_q/to_k/to_v`) and text
+(`add_q_proj/add_k_proj/add_v_proj`). All three projections in a stream
+read the **same** input, so they fuse into a single GEMM per stream
+(`to_qkv` and `to_added_qkv`, each `nn.Linear(D, 3*D)`); the forward
+slices the output back with `chunk(3, dim=-1)`. This cuts kernel launches
+and feeds cuBLAS a larger, better-utilised matmul in both forward and
+backward, across all 60 blocks × 2 streams.
+
+Numerically identical to the split projections (the fused output is just
+`cat([q, k, v])` along the feature dim, sliced back per stream) up to
+bf16 GEMM-tiling rounding — well inside the SFT alignment tolerance.
+
+Transparent end-to-end, so no offline checkpoint prep is needed:
+
+| Boundary | What happens |
+|----------|--------------|
+| Load (training start) | The released split `to_q/to_k/to_v` (+ `add_*_proj`) weights are merged into `to_qkv` / `to_added_qkv` at load time by `QwenImageEditFuseQKVConverter` (`cat([q, k, v], dim=0)`). |
+| Export (after training) | `scripts/merge_dcp_to_diffusers.py` splits them back (`chunk(3, dim=0)`) so the diffusers checkpoint keeps the released split layout. |
+
+The fused weights only ever live inside the model and the DCP checkpoint;
+the base checkpoint and the exported inference checkpoint are both in the
+standard split layout.
+
+Set `--model.model_config.fused_qkv false` to train with the original
+split projections (e.g. for numerical-alignment debugging) — the load and
+export converters both no-op in that case, so behaviour is identical to
+before this option existed. **With LoRA**, fused changes the attention
+`target_modules` from `[to_q, to_k, to_v, add_q_proj, add_k_proj,
+add_v_proj]` to `[to_qkv, to_added_qkv]`; update the LoRA config
+accordingly or set `fused_qkv: false` for that run.
+
 ---
 
 ## 4. Convert DCP checkpoint to a single-file format
@@ -318,6 +352,13 @@ python scripts/merge_dcp_to_diffusers.py \
 
 `--shard-size 10000000000` (10 GB) matches the upstream Qwen-Image-Edit-2511
 shard layout (5 shards, ~10 GB each).
+
+When the run used `fused_qkv: true` (see §3.3), the DCP holds fused
+`to_qkv` / `to_added_qkv` tensors; this script splits each back into the
+released `to_q/to_k/to_v` (+ `add_*_proj`) keys automatically, so the
+output is a standard split-layout diffusers checkpoint either way. No
+extra flag is needed — the split is keyed off the tensor names present in
+the DCP.
 
 ---
 

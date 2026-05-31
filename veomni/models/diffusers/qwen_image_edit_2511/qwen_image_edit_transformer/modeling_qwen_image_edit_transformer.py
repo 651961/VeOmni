@@ -483,37 +483,50 @@ def _flash_or_sdpa_attention(
 class QwenDoubleStreamAttention(nn.Module):
     """Dual-stream joint attention.
 
-    Image and text streams each have their own Q/K/V projections (``to_*`` for
-    image, ``add_*_proj`` for text) and head-norms (``norm_q/k`` for image,
-    ``norm_added_q/k`` for text). The two streams are concatenated along the
-    token dim before the SDPA call, then split back to separate output
-    projections (``to_out.0`` and ``to_add_out``).
+    Image and text streams each have their own Q/K/V projections and head-norms
+    (``norm_q/k`` for image, ``norm_added_q/k`` for text). The two streams are
+    concatenated along the token dim before the SDPA call, then split back to
+    separate output projections (``to_out.0`` and ``to_add_out``).
 
-    State-dict prefix:
-        attn.to_{q,k,v}.{weight,bias}
+    When ``fused_qkv`` is True (default) each stream uses a single fused GEMM
+    (``to_qkv`` / ``to_added_qkv``) whose output is sliced into Q/K/V; the
+    released checkpoint's separate weights are merged at load time by
+    ``QwenImageEditFuseQKVConverter``. When False the original split
+    projections (``to_{q,k,v}`` / ``add_{q,k,v}_proj``) are used.
+
+    State-dict prefix (fused):
+        attn.to_qkv.{weight,bias}        # [3*dim_a, dim_a] = cat(q, k, v)
         attn.norm_{q,k}.weight
-        attn.add_{q,k,v}_proj.{weight,bias}
+        attn.to_added_qkv.{weight,bias}  # [3*dim_b, dim_b] = cat(q, k, v)
         attn.norm_added_{q,k}.weight
-        attn.to_out.0.{weight,bias}     # ``to_out`` is a Sequential([Linear])
+        attn.to_out.0.{weight,bias}      # ``to_out`` is a Sequential([Linear])
         attn.to_add_out.{weight,bias}
+    State-dict prefix (split): attn.to_{q,k,v}.* and attn.add_{q,k,v}_proj.*
     """
 
-    def __init__(self, dim_a: int, dim_b: int, num_heads: int, head_dim: int):
+    def __init__(self, dim_a: int, dim_b: int, num_heads: int, head_dim: int, fused_qkv: bool = True):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.fused_qkv = fused_qkv
 
-        # Image stream.
-        self.to_q = nn.Linear(dim_a, dim_a)
-        self.to_k = nn.Linear(dim_a, dim_a)
-        self.to_v = nn.Linear(dim_a, dim_a)
+        # Image stream. Fused output order is [q, k, v] along the feature dim.
+        if fused_qkv:
+            self.to_qkv = nn.Linear(dim_a, 3 * dim_a)
+        else:
+            self.to_q = nn.Linear(dim_a, dim_a)
+            self.to_k = nn.Linear(dim_a, dim_a)
+            self.to_v = nn.Linear(dim_a, dim_a)
         self.norm_q = _RMSNorm(head_dim, eps=1e-6)
         self.norm_k = _RMSNorm(head_dim, eps=1e-6)
 
         # Text stream.
-        self.add_q_proj = nn.Linear(dim_b, dim_b)
-        self.add_k_proj = nn.Linear(dim_b, dim_b)
-        self.add_v_proj = nn.Linear(dim_b, dim_b)
+        if fused_qkv:
+            self.to_added_qkv = nn.Linear(dim_b, 3 * dim_b)
+        else:
+            self.add_q_proj = nn.Linear(dim_b, dim_b)
+            self.add_k_proj = nn.Linear(dim_b, dim_b)
+            self.add_v_proj = nn.Linear(dim_b, dim_b)
         self.norm_added_q = _RMSNorm(head_dim, eps=1e-6)
         self.norm_added_k = _RMSNorm(head_dim, eps=1e-6)
 
@@ -527,8 +540,14 @@ class QwenDoubleStreamAttention(nn.Module):
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        img_q, img_k, img_v = self.to_q(image), self.to_k(image), self.to_v(image)
-        txt_q, txt_k, txt_v = self.add_q_proj(text), self.add_k_proj(text), self.add_v_proj(text)
+        if self.fused_qkv:
+            # One GEMM per stream; chunk slices the fused output into Q/K/V
+            # (same [q, k, v] order the converter packs the weight in).
+            img_q, img_k, img_v = self.to_qkv(image).chunk(3, dim=-1)
+            txt_q, txt_k, txt_v = self.to_added_qkv(text).chunk(3, dim=-1)
+        else:
+            img_q, img_k, img_v = self.to_q(image), self.to_k(image), self.to_v(image)
+            txt_q, txt_k, txt_v = self.add_q_proj(text), self.add_k_proj(text), self.add_v_proj(text)
         seq_txt = txt_q.shape[1]
 
         img_q = rearrange(img_q, "b s (h d) -> b h s d", h=self.num_heads)
@@ -572,7 +591,14 @@ class QwenImageTransformerBlock(nn.Module):
     see ``t=0``).
     """
 
-    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        eps: float = 1e-6,
+        fused_qkv: bool = True,
+    ):
         super().__init__()
         self.dim = dim
         self.num_attention_heads = num_attention_heads
@@ -581,7 +607,7 @@ class QwenImageTransformerBlock(nn.Module):
         self.img_mod = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.attn = QwenDoubleStreamAttention(
-            dim_a=dim, dim_b=dim, num_heads=num_attention_heads, head_dim=attention_head_dim
+            dim_a=dim, dim_b=dim, num_heads=num_attention_heads, head_dim=attention_head_dim, fused_qkv=fused_qkv
         )
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_mlp = QwenFeedForward(dim=dim, dim_out=dim)
@@ -742,6 +768,7 @@ class QwenImageEditTransformerModel(PreTrainedModel):
                     dim=dim,
                     num_attention_heads=config.num_attention_heads,
                     attention_head_dim=config.attention_head_dim,
+                    fused_qkv=config.fused_qkv,
                 )
                 for _ in range(config.num_layers)
             ]
