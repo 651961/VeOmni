@@ -13,21 +13,19 @@
 # limitations under the License.
 
 import math
-import os
-import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
-from datasets import Dataset
 from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
 from ..data.data_collator import DataCollator
+from ..data.diffusion.offline_embedding_saver import OfflineEmbeddingSaver, pack_condition_for_save
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
 from ..distributed.parallel_state import get_parallel_state
 from ..models import build_foundation_model
@@ -45,66 +43,6 @@ from .base import BaseTrainer
 
 
 logger = helper.create_logger(__name__)
-
-
-class OfflineEmbeddingSaver:
-    def __init__(self, save_path: str, dataset_length: int = 0, shard_num: int = 1, max_shard=1000):
-        from ..distributed.parallel_state import get_parallel_state
-
-        self.dp_rank = get_parallel_state().dp_rank
-        dp_size = get_parallel_state().dp_size
-        if dp_size * shard_num > max_shard:
-            shard_num = max_shard // dp_size
-            logger.info_rank0(f"shard_num * dp_size must be smaller than max_shard, set shard_num = {shard_num}")
-        self.shard_num = shard_num
-        self.max_shard = max_shard
-        self.index = 0
-        self.buffer = []
-
-        self.save_path = save_path
-        self.dataset_length = dataset_length
-        self.batch_len = math.ceil(dataset_length / self.shard_num)
-        logger.info(f"Rank [{self.dp_rank}] save to [{self.save_path}] each batch_len [{self.batch_len}].")
-        os.makedirs(self.save_path, exist_ok=True)
-        self.rest_len = self.dataset_length
-
-    @staticmethod
-    def _cpu_recursive(obj):
-        """Move tensors to CPU recursively, leave other types unchanged."""
-        if isinstance(obj, torch.Tensor):
-            return obj.cpu()
-        if isinstance(obj, dict):
-            return {k: OfflineEmbeddingSaver._cpu_recursive(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return type(obj)(OfflineEmbeddingSaver._cpu_recursive(v) for v in obj)
-        return obj
-
-    def to_save_bytes(self, save_item: Dict[str, torch.Tensor]):
-        converted_dict = {}
-        for key in list(save_item.keys()):
-            converted_dict[key] = pk.dumps(self._cpu_recursive(save_item[key]))
-            del save_item[key]
-        return converted_dict
-
-    def _append_item(self, save_item: Dict[str, torch.Tensor]):
-        if self.rest_len > 0:  # 多余的dummy data buffer 不保存
-            self.buffer.append(self.to_save_bytes(save_item))
-            self.rest_len -= 1
-
-    def save(self, save_item):
-        self._append_item(save_item)
-        if len(self.buffer) >= self.batch_len:
-            ds = Dataset.from_list(self.buffer)
-            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
-            self.buffer = []
-            self.index += 1
-
-    def save_last(self):
-        if len(self.buffer) > 0:
-            ds = Dataset.from_list(self.buffer)
-            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
-            self.buffer = []
-            self.index += 1
 
 
 @dataclass
@@ -415,6 +353,8 @@ class DiTTrainer:
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
+                    dp_rank=dp_rank,
+                    dp_size=dp_size,
                 )
                 padded_len = (
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
@@ -516,14 +456,6 @@ class DiTTrainer:
         loss = torch.stack(list(loss_dict.values())).sum()
         return loss, loss_dict
 
-    @staticmethod
-    def _unpack_dict_of_list(batch: Dict[str, Any]) -> list[Dict[str, Any]]:
-        if not isinstance(batch, dict) or len(batch) == 0:
-            return []
-        keys = list(batch.keys())
-        num_items = len(batch[keys[0]])
-        return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
-
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
         micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training" or self.training_task == "offline_embedding":
@@ -532,8 +464,16 @@ class DiTTrainer:
 
         if self.training_task == "offline_embedding":
             if self.offline_embedding_saver is not None:  # sp_rank 0 save
-                for item in self._unpack_dict_of_list(micro_batch):
-                    self.offline_embedding_saver.save(item)
+                # ``get_condition`` returns un-batched per-sample tensors
+                # (prompt_emb ``(L, 3584)``, mask ``(L,)``). Pack each sample
+                # back into the cache contract via ``pack_condition_for_save``
+                # so the singleton batch dim is restored (prompt_emb
+                # ``(1, L, 3584)``, mask ``(1, L)``); otherwise the offline
+                # read path feeds 1-D masks into the DiT forward and
+                # ``prompt_emb_mask.sum(dim=1)`` raises.
+                num_samples = len(micro_batch["latents"])
+                for sample_idx in range(num_samples):
+                    self.offline_embedding_saver.save(pack_condition_for_save(micro_batch, sample_idx))
             del micro_batch
             return 0.0, {}
 
