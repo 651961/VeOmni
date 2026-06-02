@@ -151,6 +151,18 @@ bash train.sh tasks/train_dit.py \
     --train.checkpoint.output_dir /path/to/checkpoints/qwen_image_edit_2511_runs
 ```
 
+To resume from an interrupted run, add `--train.checkpoint.load_path` with
+the **same `output_dir`** (and the same hyperparameters). It restores model
+weights, optimizer state, `global_step`, LR scheduler, and dataloader
+position — training continues from exactly where it stopped.
+
+```shell
+# explicit checkpoint
+    --train.checkpoint.load_path /path/to/checkpoints/qwen_image_edit_2511_runs/checkpoints/global_step_1500
+# or auto-pick the latest under output_dir
+    --train.checkpoint.load_path auto
+```
+
 Per-step flow:
 
 - The `dit_offline` data transform unpickles the four cached fields into
