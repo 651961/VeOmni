@@ -151,17 +151,27 @@ bash train.sh tasks/train_dit.py \
     --train.checkpoint.output_dir /path/to/checkpoints/qwen_image_edit_2511_runs
 ```
 
-To resume from an interrupted run, add `--train.checkpoint.load_path` with
-the **same `output_dir`** (and the same hyperparameters). It restores model
-weights, optimizer state, `global_step`, LR scheduler, and dataloader
-position — training continues from exactly where it stopped.
+To resume from an interrupted run, add `--train.checkpoint.load_path` and
+`--train.wandb.id` with the **same `output_dir`** (and the same
+hyperparameters). It restores model weights, optimizer state, `global_step`,
+LR scheduler, and dataloader position — training continues from exactly
+where it stopped.
 
 ```shell
 # explicit checkpoint
     --train.checkpoint.load_path /path/to/checkpoints/qwen_image_edit_2511_runs/checkpoints/global_step_1500
 # or auto-pick the latest under output_dir
     --train.checkpoint.load_path auto
+# continue the original wandb curve instead of starting a new one
+    --train.wandb.id <original_run_id>
 ```
+
+> **Why `--train.wandb.id`?** Without it, the resumed job creates a *new*
+> wandb run, so the dashboard shows two disconnected curves. Pass the
+> original run's id (the 8-char suffix in its wandb URL,
+> `https://wandb.ai/<entity>/<project>/runs/<run_id>`) and VeOmni calls
+> `wandb.init(resume="allow")` — metrics continue on the same curve at the
+> correct `global_step`. Do **not** set `id` on the first launch.
 
 Per-step flow:
 
