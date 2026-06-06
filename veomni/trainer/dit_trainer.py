@@ -350,9 +350,13 @@ class DiTTrainer:
                 extra = dataset_len % dp_size
                 valid_data_length = base_count + (1 if dp_rank < extra else 0)
                 logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
+                # shard_num 必须 >1:默认 1 会让每个 rank 把全程 embedding 攒在
+                # CPU 内存里、最后才一次性写 parquet,大数据集直接 OOM(SIGKILL)。
+                # 按每 shard ~500 样本增量 flush,buffer 峰值控制在几 GB / rank。
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
+                    shard_num=max(1, math.ceil(valid_data_length / 500)),
                     dp_rank=dp_rank,
                     dp_size=dp_size,
                 )
