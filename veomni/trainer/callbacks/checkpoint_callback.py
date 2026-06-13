@@ -57,6 +57,16 @@ class CheckpointerCallback(Callback):
                     f"already saved at step_end)."
                 )
 
+    def on_train_end(self, state: TrainerState, **kwargs):
+        if self.every_n_steps or self.every_n_epochs:
+            if state.global_step != self._last_saved_step:
+                self._save_checkpoint(state)
+            else:
+                logger.info_rank0(
+                    f"Skipping duplicate checkpoint save at train_end (global_step {state.global_step} "
+                    f"already saved)."
+                )
+
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 

@@ -125,6 +125,48 @@ class TestCheckpointerCallbackLastSavedStep:
         # Should skip — no new save call
         trainer.checkpointer.save.assert_not_called()
 
+    def test_train_end_saves_final_step_when_not_already_saved(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+        cb.every_n_steps = 250
+        cb.every_n_epochs = 0
+
+        cb.on_step_end(TrainerState(global_step=8750))
+        assert cb._last_saved_step == 8750
+
+        trainer.checkpointer.save.reset_mock()
+        cb.on_train_end(TrainerState(global_step=8960))
+
+        assert trainer.checkpointer.save.call_count == 1
+        assert cb._last_saved_step == 8960
+
+    def test_train_end_skips_after_successful_step_save(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+        cb.every_n_steps = 250
+        cb.every_n_epochs = 0
+
+        cb.on_step_end(TrainerState(global_step=9000))
+        assert cb._last_saved_step == 9000
+
+        trainer.checkpointer.save.reset_mock()
+        cb.on_train_end(TrainerState(global_step=9000))
+
+        trainer.checkpointer.save.assert_not_called()
+
+    def test_train_end_does_not_save_when_checkpointing_disabled(self, mock_helper, mock_dist, mock_build_ckpt):
+        trainer = _make_mock_trainer()
+        mock_build_ckpt.return_value = trainer.checkpointer
+        cb = CheckpointerCallback(trainer)
+        cb.every_n_steps = 0
+        cb.every_n_epochs = 0
+
+        cb.on_train_end(TrainerState(global_step=8960))
+
+        trainer.checkpointer.save.assert_not_called()
+
 
 @patch("veomni.trainer.callbacks.checkpoint_callback.save_hf_safetensor")
 @patch("veomni.trainer.callbacks.checkpoint_callback.build_checkpointer")
