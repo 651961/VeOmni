@@ -75,7 +75,8 @@ try:
 except ImportError:
     _FLASH_ATTN_AVAILABLE = False
     _fa3_op_fwd = None
-
+_FLASH_ATTN_AVAILABLE = False
+_fa3_op_fwd = None
 
 # --------------------------------------------------------------------------- #
 # Dynamo-traceable wrappers for the rotary triton kernel and FA3 forward.
