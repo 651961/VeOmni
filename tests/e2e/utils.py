@@ -82,6 +82,11 @@ class ParallelMode:
 
 _SP_SIZE = [1, 2]
 _EP_SIZE = [1, 2]
+_WAN_BFLOAT16_TRAINING_ARGS = [
+    "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+    "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+    "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+]
 
 
 def _base_model_modes():
@@ -152,6 +157,8 @@ def prepare_exec_cmd(
                 # are emitted on the NPU side.
                 model_name=model_name,
             )
+            if model_name == "wan_t2v":
+                cmd_kwargs["extra_args"] = list(_WAN_BFLOAT16_TRAINING_ARGS)
             command_list.append((task_name, cmd_kwargs))
 
     return command_list

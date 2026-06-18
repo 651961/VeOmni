@@ -27,6 +27,9 @@ Features:
 """
 
 import json
+import os
+import queue
+import threading
 import warnings
 from abc import ABC
 from collections import defaultdict
@@ -65,6 +68,7 @@ from ..utils.device import (
     get_device_type,
     get_dist_comm_backend,
     get_torch_device,
+    is_nccl_backend,
     synchronize,
 )
 from ..utils.loss_utils import count_loss_token, mean_global_loss
@@ -84,6 +88,111 @@ from .callbacks import (
 
 
 logger = logging.get_logger(__name__)
+
+
+class BackgroundPrefetcher:
+    """
+    Prefetches batches from a dataloader in a background thread to overlap data loading
+    with GPU computation. Synchronizes dataloader state for correct checkpointing.
+    """
+
+    def __init__(self, dataloader, maxsize=1):
+        self.dataloader = dataloader
+        self.iterator = iter(dataloader)
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.stop_event = threading.Event()
+        self.original_state_dict = getattr(dataloader, "state_dict", None)
+        self.current_state = None
+        self.thread = threading.Thread(target=self._worker)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def _worker(self):
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    item = next(self.iterator)
+                except StopIteration:
+                    self.queue.put((StopIteration, None))
+                    break
+
+                # Ensure we capture the state so that subsequent dataloader advances
+                # don't mutate the captured state in-place. The underlying dataloader's
+                # state_dict() should handle deepcopying if necessary.
+                state = self.original_state_dict() if self.original_state_dict else None
+                self.queue.put((item, state))
+        except Exception as e:
+            self.queue.put((e, None))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        res = self.queue.get()
+        if isinstance(res, tuple) and len(res) == 2:
+            item, state = res
+            if item is StopIteration:
+                raise StopIteration
+            if isinstance(item, Exception):
+                raise item
+            self.current_state = state
+            return item
+        else:
+            if res is StopIteration:
+                raise StopIteration
+            if isinstance(res, Exception):
+                raise res
+            return res
+
+    def state_dict(self):
+        if self.current_state is not None:
+            return self.current_state
+        if self.original_state_dict:
+            return self.original_state_dict()
+        return {}
+
+    def stop(self, timeout: float = 5.0):
+        self.stop_event.set()
+        try:
+            while not self.queue.empty():
+                self.queue.get_nowait()
+        except queue.Empty:
+            pass
+        if self.thread.is_alive():
+            self.thread.join(timeout=timeout)
+            if self.thread.is_alive():
+                logger.warning("BackgroundPrefetcher worker thread did not terminate within timeout.")
+
+
+class VeOmniIter:
+    """
+    A unified iterator wrapper that handles both standard iteration and background prefetching.
+    """
+
+    def __init__(self, dataloader, use_background_prefetcher: bool = False, maxsize: int = 1):
+        self.dataloader = dataloader
+        self.use_background_prefetcher = use_background_prefetcher
+        if use_background_prefetcher:
+            self.iterator = BackgroundPrefetcher(dataloader, maxsize=maxsize)
+        else:
+            self.iterator = iter(dataloader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.iterator)
+
+    def stop(self, timeout: float = 5.0):
+        if self.use_background_prefetcher and hasattr(self.iterator, "stop"):
+            self.iterator.stop(timeout=timeout)
+
+    def state_dict(self):
+        if self.use_background_prefetcher and hasattr(self.iterator, "state_dict"):
+            return self.iterator.state_dict()
+        if hasattr(self.dataloader, "state_dict"):
+            return self.dataloader.state_dict()
+        return {}
 
 
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
@@ -351,6 +460,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
+        dataloader_kwargs.pop("use_background_prefetcher", None)
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
@@ -363,9 +473,12 @@ class BaseTrainer(Stateful, ABC):
             bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
             dyn_bsz=args.train.dyn_bsz,
             dyn_bsz_runtime=args.train.dyn_bsz_runtime,
+            dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
+            dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
             dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
             seed=args.train.seed,
             collate_fn=self.collate_fn,
+            save_steps=args.train.checkpoint.save_steps,
             **dataloader_kwargs,
         )
 
@@ -382,6 +495,9 @@ class BaseTrainer(Stateful, ABC):
             kwargs["is_peft_model"] = True
 
         muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+
+        if args.model.fqn_to_index_mapping is not None:
+            kwargs["fqn_to_index_mapping"] = args.model.fqn_to_index_mapping
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -634,8 +750,21 @@ class BaseTrainer(Stateful, ABC):
         self.on_step_end(loss=total_loss, loss_dict=total_loss_dict, grad_norm=grad_norm)
 
     def destroy_distributed(self):
+        if not dist.is_available() or not dist.is_initialized():
+            return
+
+        backend = dist.get_backend()
         helper.empty_cache()
         dist.barrier()
+
+        if is_nccl_backend(backend) and os.getenv("VEOMNI_DESTROY_NCCL_ON_EXIT", "0") != "1":
+            logger.info_rank0(
+                "Skipping explicit NCCL process-group destroy on normal trainer exit. "
+                "Set VEOMNI_DESTROY_NCCL_ON_EXIT=1 to restore the previous teardown behavior."
+            )
+            return
+
+        synchronize()
         dist.destroy_process_group()
 
     def train(self):
@@ -657,11 +786,13 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_begin()
 
             # Create a batch generator
-            data_iterator = iter(self.train_dataloader)
+            self.data_iterator = VeOmniIter(
+                self.train_dataloader, use_background_prefetcher=args.data.dataloader.use_background_prefetcher
+            )
 
             for _ in range(self.start_step, args.train_steps):
                 try:
-                    self.train_step(data_iterator)
+                    self.train_step(self.data_iterator)
                 except StopIteration:
                     logger.info(f"epoch:{epoch} Dataloader finished with drop_last {args.data.dataloader.drop_last}")
                     break
@@ -672,7 +803,13 @@ class BaseTrainer(Stateful, ABC):
 
             helper.print_device_mem_info(f"VRAM usage after epoch {epoch + 1}")
 
+            if args.data.dataloader.use_background_prefetcher:
+                self.data_iterator.stop()
+
         self.on_train_end()
+
+        if "data_iterator" in locals() and args.data.dataloader.use_background_prefetcher:
+            self.data_iterator.stop()
 
         synchronize()
 

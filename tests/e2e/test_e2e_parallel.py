@@ -43,6 +43,7 @@ def _materialize_weights_dir(config_path: str, output_path: str, save_original_f
         init_device="cpu",
         ops_implementation=make_eager_ops_config(),
     )
+
     model.save_pretrained(output_path, save_original_format=save_original_format)
 
 
@@ -241,7 +242,20 @@ qwen_image_dit_test_cases = [
         False,
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
-        1,  # Ulysses SP for Qwen-Image needs a model-specific joint-attention patch.
+        2,  # Ulysses SP enabled via QwenImageSPAttnProcessor + forward patch.
+        marks=[_dit_only, _qwen_image_npu_skip],
+    ),
+]
+
+# Reuses the toy model config; only the dataset differs (odd seq lens).
+qwen_image_dit_padding_test_cases = [
+    pytest.param(
+        "qwen_image",
+        "./tests/toy_config/qwen_image_toy/config.json",
+        False,
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        2,
         marks=[_dit_only, _qwen_image_npu_skip],
     ),
 ]
@@ -298,6 +312,14 @@ def dummy_wan_t2v_dataset():
 @pytest.fixture(scope="session")
 def dummy_qwen_image_dataset():
     dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen_image")
+    train_path = dummy_dataset.save_path
+    yield train_path
+    del dummy_dataset
+
+
+@pytest.fixture(scope="session")
+def dummy_qwen_image_padding_dataset():
+    dummy_dataset = DummyDataset(seq_len=2048, dataset_type="qwen_image_padding")
     train_path = dummy_dataset.save_path
     yield train_path
     del dummy_dataset
@@ -392,6 +414,29 @@ def test_qwen3omni_parallel_align(
     )
 
 
+def test_wan_dit_uses_bfloat16_and_flash_attention():
+    command_list = prepare_exec_cmd(
+        ["train_dit_test"],
+        "wan_t2v",
+        "./tests/toy_config/wan_t2v_toy",
+        model_path="./wan_t2v",
+        train_path="./dummy_wan_t2v",
+        output_dir="./wan_t2v",
+        is_moe=False,
+        max_sp_size=1,
+    )
+
+    assert command_list
+    for _, cmd_kwargs in command_list:
+        cmd = build_torchrun_cmd(**cmd_kwargs)
+        assert cmd_kwargs["extra_args"] == [
+            "--train.accelerator.fsdp_config.mixed_precision.enable=True",
+            "--train.accelerator.fsdp_config.mixed_precision.param_dtype=bfloat16",
+            "--train.accelerator.fsdp_config.mixed_precision.cast_forward_inputs=True",
+        ]
+        assert "--model.ops_implementation.attn_implementation=flash_attention_2" in cmd
+
+
 @pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol", wan_dit_test_cases)
 def test_wan_dit_parallel_align(
     model_name: str, config_path: str, is_moe: bool, rtol: float, atol: float, dummy_wan_t2v_dataset
@@ -420,7 +465,9 @@ def test_qwen_image_dit_parallel_align(
     max_sp_size: int,
     dummy_qwen_image_dataset,
 ):
-    """Validate Qwen-Image toy training under FSDP2 without Ulysses SP."""
+    """Validate that QwenImageTransformer2DModel loss and grad_norm are identical
+    with and without Ulysses sequence-parallelism at equal DP sizes.
+    """
     main(
         task_name="train_dit_test",
         model_name=model_name,
@@ -429,5 +476,30 @@ def test_qwen_image_dit_parallel_align(
         rtol=rtol,
         atol=atol,
         train_path=dummy_qwen_image_dataset,
+        max_sp_size=max_sp_size,
+    )
+
+
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", qwen_image_dit_padding_test_cases)
+def test_qwen_image_dit_parallel_align_padding(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int,
+    dummy_qwen_image_padding_dataset,
+):
+    """SP-vs-no-SP alignment with non-``sp_size``-divisible image/text lengths,
+    exercising the Ulysses-SP pad/truncate path that the default 16/8 case skips.
+    """
+    main(
+        task_name="train_dit_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_qwen_image_padding_dataset,
         max_sp_size=max_sp_size,
     )

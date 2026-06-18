@@ -14,20 +14,21 @@ Violating any of these causes silent bugs, crashes, or incorrect training result
    - Mismatches cause fallback to vanilla HuggingFace loading, which misses VeOmni patches (flash attention, sequence parallel).
 
 3. **Patchgen-generated files must not be edited manually**
-   - Files under `veomni/models/transformers/*/generated/` are created by `python -m veomni.patchgen.run_codegen`.
+   - Files under `veomni/models/transformers/*/generated/` are created by the `patchgen` CLI (entry point installed by the `patchgen` package).
    - Manual edits are silently overwritten on the next patchgen run.
    - To change generated behavior, edit the patch spec (`patch_spec.py`) or the modeling patch file (`modeling_*_patch.py`).
 
-4. **Transformers version: pinned to v5.2.0**
-   - VeOmni installs `transformers==5.2.0` via the `transformers-stable`
+4. **Transformers version: pinned to v5.9.0**
+   - VeOmni installs `transformers==5.9.0` via the `transformers-stable`
      default dependency group in `pyproject.toml`.
    - The legacy v4 path was removed; all modeling under
      `veomni/models/transformers/<m>/` is patchgen-generated.
    - `is_transformers_version_greater_or_equal_to()` from
      `veomni/utils/import_utils.py` is retained only for forward-looking
-     gates (e.g. `>= 5.3.0` for newer HF APIs) — do **not** add new
-     `>= 5.0.0` or `>= 5.2.0` branches.
-   - Patchgen regeneration must be done with `transformers==5.2.0` installed.
+     gates (for HF APIs newer than the current pin) — do **not** add new
+     version gates for versions `<= 5.9.0` (the legacy `>= 5.0.0` …
+     `>= 5.8.x` interval is dead code).
+   - Patchgen regeneration must be done with `transformers==5.9.0` installed.
 
 ## Distributed Training
 
@@ -95,10 +96,12 @@ Core files:
     - These must be in the batch dict **before** the model forward pass. Recomputing per-layer causes host-device sync.
     - Multimodal models may have 3D position_ids `(B, dim, L)` — FA uses the first row `[:, 0, :]`.
 
-11. **`attention_mask` sum = token count for dynamic batching**
-    - Dynamic batching (`DynamicBatchingSizeDataset`, `DynBszBuffer`) uses `attention_mask.sum()` as the length function.
-    - With FA varlen, `attention_mask` is expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
+11. **Dynamic batching token counting must match `dyn_bsz_count_mode`**
+    - Default / legacy behavior (`train.dyn_bsz_count_mode="total"`) uses `attention_mask.sum()` as the length function in `DynamicBatchingSizeDataset` and `DynBszBuffer`.
+    - Optional effective-token mode (`"effective"`) uses `(labels != IGNORE_INDEX).sum()` when `labels` are present, and falls back to `attention_mask.sum()` otherwise.
+    - With FA varlen, `attention_mask` is still expected to be all-ones over packed length; boundaries come from `position_ids` and `cu_seq_lens`.
     - When SP is enabled, `attention_mask` must use `sp_pad_value=1` (asserted in `MainCollator.__post_init__`).
+    - In effective-token mode, dynamic batching still applies a hard physical-token cap of `micro_batch_size * max_seq_len` during micro-batch selection to avoid unbounded prompt-heavy batches; a single sample may still exceed the cap by itself and should be controlled by preprocessing.
 
 12. **`IGNORE_INDEX` (-100) for loss masking**
     - Labels set to `IGNORE_INDEX` are excluded from loss computation.

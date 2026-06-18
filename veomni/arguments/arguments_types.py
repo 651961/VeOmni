@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
 from dataclasses import dataclass, field
@@ -507,6 +506,29 @@ class TrainingArguments:
         default="main",
         metadata={"help": "Which process dynamic batching runs in: main process or DataLoader worker."},
     )
+    dyn_bsz_count_mode: Literal["total", "effective"] = field(
+        default="total",
+        metadata={
+            "help": (
+                "How dynamic batching counts tokens when packing a micro batch. "
+                "'total' (default, legacy) sums attention_mask; 'effective' sums "
+                "only loss-contributing tokens (labels != IGNORE_INDEX), which "
+                "balances effective tokens across DP ranks at the cost of allowing "
+                "controlled physical-token overflow."
+            )
+        },
+    )
+    dyn_bsz_physical_overflow_ratio: float = field(
+        default=1.5,
+        metadata={
+            "help": (
+                "Physical-token cap multiplier used when dyn_bsz_count_mode='effective'. "
+                "The cap is ceil(micro_batch_size * max_seq_len * ratio), so values "
+                "> 1.0 let effective-token batching differ from total-token batching "
+                "while still bounding prompt-heavy micro batches."
+            )
+        },
+    )
     init_device: Literal["cpu", "cuda", "meta", "npu"] = field(
         default="meta",
         metadata={
@@ -575,6 +597,11 @@ class TrainingArguments:
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
 
     def __post_init__(self):
+        if self.dyn_bsz_physical_overflow_ratio < 1.0:
+            raise ValueError(
+                f"dyn_bsz_physical_overflow_ratio must be >= 1.0, got {self.dyn_bsz_physical_overflow_ratio}."
+            )
+
         self._train_steps = -1
         self.local_rank = int(os.getenv("LOCAL_RANK", 0))
         self.global_rank = int(os.getenv("RANK", 0))
@@ -859,7 +886,7 @@ class OpsImplementationConfig:
         metadata={
             "help": "Chunk gated delta-rule kernel for Qwen3.5 linear attention. "
             "'fla' (default) uses fla.ops.gated_delta_rule.chunk_gated_delta_rule (requires flash-linear-attention, GPU). "
-            "'flash_qla' uses QwenLM FlashQLA (requires the optional flash-qla extra, Hopper SM90 only — "
+            "'flash_qla' uses QwenLM FlashQLA (ships under the gpu extra, Hopper SM90 only — "
             "no Ampere/Ada below or Blackwell above; SM10x wheels are WIP upstream). "
             "'eager' uses transformers' torch_chunk_gated_delta_rule, which does NOT support "
             "cu_seqlens; varlen training therefore raises at runtime. "
@@ -1019,12 +1046,12 @@ class ModelArguments:
             if os.path.exists(default_idx_path):
                 self.safetensor_idx_path = default_idx_path
 
-        # Parse fqn_to_index_mapping from safetensor index json
+        # Parse raw HF weight_map from safetensor index json (MoE key renames happen at runtime).
         self.fqn_to_index_mapping = None
         if self.safetensor_idx_path is not None:
-            with open(self.safetensor_idx_path) as f:
-                weight_map = json.load(f)["weight_map"]
-            self.fqn_to_index_mapping = {fqn: int(filename.split("-")[1]) for fqn, filename in weight_map.items()}
+            from ..models.checkpoint_tensor_loading import parse_fqn_to_index_mapping_from_json
+
+            self.fqn_to_index_mapping = parse_fqn_to_index_mapping_from_json(self.safetensor_idx_path)
         if self.fqn_to_index_mapping is None:
             logger.warning_rank0(
                 "fqn_to_index_mapping is None, saved safetensor will be a single file instead of sharded."
@@ -1092,6 +1119,10 @@ class DataloaderConfig:
     pin_memory: bool = field(
         default=True,
         metadata={"help": "Whether to pin memory for dataloader."},
+    )
+    use_background_prefetcher: bool = field(
+        default=False,
+        metadata={"help": "Whether to use BackgroundPrefetcher for dataloader."},
     )
 
 
