@@ -91,6 +91,18 @@ _GPU_PER_MODEL_OVERRIDES: Dict[str, Dict[str, str]] = {
     # L20 runners where another job is still holding part of the card.
     "qwen3_5": {"cross_entropy_loss_implementation": "chunk_loss"},
     "qwen3_5_moe": {"cross_entropy_loss_implementation": "chunk_loss"},
+    # GPT-OSS intentionally does not register a Triton MoE backend because its
+    # native interleaved gate/up training layout needs either eager reference
+    # math or the dedicated SM90-only Quack path. Keep the shared helper on the
+    # portable eager baseline; capability-gated tests append FA4/Quack flags.
+    "gpt_oss": {
+        "attn_implementation": "eager",
+        "moe_implementation": "eager",
+        "cross_entropy_loss_implementation": "eager",
+        "load_balancing_loss_implementation": "eager",
+        "rms_norm_implementation": "eager",
+        "rotary_pos_emb_implementation": "eager",
+    },
 }
 
 

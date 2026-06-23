@@ -893,6 +893,14 @@ class OpsImplementationConfig:
             "Qwen3.5 has no NPU backend today — selecting any non-eager value on NPU raises at OpSlot bind time."
         },
     )
+    dsa_indexer_backend: Literal["eager", "cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention top-k indexer backend."},
+    )
+    dsa_attention_backend: Literal["eager", "flashmla_cudnn"] = field(
+        default="eager",
+        metadata={"help": "DeepSeek sparse attention backend."},
+    )
 
     def __post_init__(self):
         if get_env("MODELING_BACKEND") == "veomni":
