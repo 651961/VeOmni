@@ -72,6 +72,8 @@ def main(
     atol: float,
     train_path: str,
     max_sp_size: int | None = None,
+    max_ep_size: int | None = None,
+    compare_alignment: bool = True,
 ):
     test_path = f"./{model_name}"
     os.makedirs(test_path, exist_ok=True)
@@ -98,7 +100,14 @@ def main(
         output_dir=test_path,
         is_moe=is_moe,
         max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
     )
+    if len(command_list) < 1:
+        raise AssertionError("Training tests require at least one parallel mode.")
+    if compare_alignment and len(command_list) < 2:
+        raise AssertionError(
+            "Alignment tests require at least two parallel modes. Use a smoke test for single-mode coverage."
+        )
     res = {}
     log_keys = []
     for task_name, cmd_kwargs in command_list:
@@ -113,9 +122,13 @@ def main(
             assert log_keys == set(output.keys())
         res[task_name] = output
 
+    if compare_alignment:
+        assert len(res) >= 2, "Alignment tests require at least two completed runs."
+
     for key in log_keys:
         print_comparison_table(res, key, title=model_name)
-    compare_metrics(res, rtol=rtol, atol=atol)
+    if compare_alignment:
+        compare_metrics(res, rtol=rtol, atol=atol)
 
     shutil.rmtree(test_path)
 
@@ -131,6 +144,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "qwen2",
@@ -139,6 +153,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "qwen3_moe",
@@ -147,6 +162,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "seed_oss",
@@ -155,6 +171,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
     ),
     pytest.param(
         "deepseek_v3",
@@ -163,6 +180,28 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
+    ),
+]
+
+deepseek_v4_text_smoke_test_cases = [
+    pytest.param(
+        "deepseek_v4",
+        "./tests/toy_config/deepseek_v4_toy",
+        True,  # is_moe
+        _DEFAULT_RTOL,
+        _DEFAULT_ATOL,
+        # DeepSeek-V4 is eager-only (no FA / SDPA / FlexAttention) and the
+        # 4D ``[B, S, hc_mult, D]`` HyperConnection residual stack isn't
+        # SP-aware yet. Force ``max_sp_size=1`` until a v4-specific
+        # eager-SP path lands.
+        1,
+        # The current generic fused MoE EP path does not preserve DeepSeek-V4's
+        # swiglu_limit clamp and is not stable for the merged gate_up layout on
+        # all backends. Keep e2e on the non-EP baseline until a V4-aware fused
+        # EP kernel lands; do not force eager MoE here because eager expert
+        # loops are incompatible with EP-sharded expert weights.
+        1,
     ),
     pytest.param(
         "gpt_oss",
@@ -171,6 +210,7 @@ text_test_cases = [
         _DEFAULT_RTOL,
         _DEFAULT_ATOL,
         None,  # max_sp_size
+        None,  # max_ep_size
         marks=_gpt_oss_fa4_quack_skip,
     ),
 ]
@@ -350,7 +390,7 @@ def dummy_qwen_image_padding_dataset():
     del dummy_dataset
 
 
-@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size", text_test_cases)
+@pytest.mark.parametrize("model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", text_test_cases)
 def test_text_parallel_align(
     model_name: str,
     config_path: str,
@@ -358,6 +398,7 @@ def test_text_parallel_align(
     rtol: float,
     atol: float,
     max_sp_size: int | None,
+    max_ep_size: int | None,
     dummy_text_dataset,
 ):
     main(
@@ -369,6 +410,34 @@ def test_text_parallel_align(
         atol=atol,
         train_path=dummy_text_dataset,
         max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_name, config_path, is_moe, rtol, atol, max_sp_size, max_ep_size", deepseek_v4_text_smoke_test_cases
+)
+def test_text_parallel_smoke(
+    model_name: str,
+    config_path: str,
+    is_moe: bool,
+    rtol: float,
+    atol: float,
+    max_sp_size: int | None,
+    max_ep_size: int | None,
+    dummy_text_dataset,
+):
+    main(
+        task_name="train_text_test",
+        model_name=model_name,
+        config_path=config_path,
+        is_moe=is_moe,
+        rtol=rtol,
+        atol=atol,
+        train_path=dummy_text_dataset,
+        max_sp_size=max_sp_size,
+        max_ep_size=max_ep_size,
+        compare_alignment=False,
     )
 
 
