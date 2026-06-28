@@ -215,7 +215,7 @@ class Krea2ConditionModel(PreTrainedModel):
         **unused,
     ) -> dict[str, Any]:
         del unused
-        assert len(latents) == 1, "Krea-2 DiT SFT currently expects micro_batch_size=1."
+        assert len(latents) == 1, "Krea-2 DiT SFT requires --train.micro_batch_size=1."
         x = latents[0]
         refs = list(edit_latents[0]) if edit_latents else []
         pe = prompt_emb[0] if isinstance(prompt_emb, list) else prompt_emb

@@ -11,7 +11,7 @@ model:
     image_size_multiple: 32
     num_train_timesteps: 1000
   ops_implementation:
-    attn_implementation: flash_attention_2
+    attn_implementation: sdpa
 
 data:
   datasets_type: mapping
