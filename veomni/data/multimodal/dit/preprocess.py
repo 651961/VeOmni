@@ -12,8 +12,9 @@ def tom_and_jerry_preprocess(conversations, **kwargs):
 
 
 @PREPROCESSOR_REGISTRY.register("Qwen-Image-Edit-2511")
+@PREPROCESSOR_REGISTRY.register("Krea2-Image-Edit")
 def qwen_image_edit_preprocess(conversations, **kwargs):
-    """Preprocessor for Qwen-Image-Edit-2511 parquet rows.
+    """Preprocessor for image-edit raw parquet rows.
 
     Each row carries:
         - ``prompt``           : str

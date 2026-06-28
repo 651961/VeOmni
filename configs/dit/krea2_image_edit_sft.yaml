@@ -1,0 +1,65 @@
+model:
+  config_path: configs/model_configs/krea2/krea2.json
+  model_path: /models/Krea-2-Raw
+  condition_model_path: configs/model_configs/krea2/krea2.json
+  model_config: {}
+  condition_model_cfg:
+    base_model_path: /models/Krea-2-Raw
+    condition_image_area: 200704      # 448 * 448
+    reference_vae_image_area: 1048576 # 1024 * 1024
+    target_image_area: 1048576        # 1024 * 1024
+    image_size_multiple: 32
+    num_train_timesteps: 1000
+  ops_implementation:
+    attn_implementation: flash_attention_2
+
+data:
+  datasets_type: mapping
+  data_type: diffusion
+  text_keys: prompt
+  train_path: /datasets/data_zsqiao/image_gen_v3/train_parquet
+  offline_embedding_save_dir: /datasets/data_zsqiao/image_gen_v3/krea2_offline_embedding
+  source_name: Krea2-Image-Edit
+  mm_configs: {}
+  dataloader:
+    type: native
+    drop_last: true
+    num_workers: 4
+    pin_memory: true
+    prefetch_factor: 2
+
+train:
+  accelerator:
+    ulysses_size: 1
+    dp_shard_size: 8
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: false
+  gradient_checkpointing:
+    enable: true
+    sac_policy: none
+  enable_compile: false
+  global_batch_size: 128
+  micro_batch_size: 1
+  init_device: meta
+  num_train_epochs: 80
+  training_task: offline_training
+  optimizer:
+    type: adamw
+    lr: 1.0e-4
+    lr_min: 1.0e-7
+    lr_warmup_ratio: 0.025
+    lr_decay_style: constant
+    weight_decay: 0.001
+    max_grad_norm: 0.2
+  checkpoint:
+    output_dir: /path/to/checkpoints/krea2_image_edit_runs
+    save_async: true
+    save_steps: 1000
+    save_epochs: 0
+    save_hf_weights: false
+  wandb:
+    enable: false
+    project: Krea2-Image-Edit-SFT
+    name: krea2-sft

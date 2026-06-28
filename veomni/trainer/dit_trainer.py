@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Optional, Sequence
@@ -250,6 +251,7 @@ class DiTTrainer:
             args.data.drop_last = False
             args.data.shuffle = False
             args.train.checkpoint.save_epochs = 0
+            args.train.checkpoint.save_steps = 0
             args.train.checkpoint.save_hf_weights = False
             # No gradient accumulation needed; process one sample per step to
             # avoid broadcast_object_list serialising all micro-batches at once
@@ -275,6 +277,7 @@ class DiTTrainer:
         dit_config = build_config(args.model.config_path, **model_config)
         self.base.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
+        self._normalize_krea2_model_paths(dit_config)
         self._build_condition_model(
             condition_model_type=dit_config.condition_model_type,
         )
@@ -292,6 +295,31 @@ class DiTTrainer:
         else:
             self.base.model = None
             logger.info_rank0(f"Task: {self.training_task}, dit model is not prepared.")
+
+    def _normalize_krea2_model_paths(self, dit_config: Any) -> None:
+        if dit_config.model_type != "Krea2Transformer2DModel":
+            return
+
+        args: VeOmniDiTArguments = self.base.args
+        condition_cfg = args.model.condition_model_cfg
+        base_model_path = args.model.model_path or condition_cfg.get("base_model_path")
+        if base_model_path is None:
+            return
+        base_model_path = os.path.normpath(base_model_path)
+        if os.path.basename(base_model_path) == "transformer":
+            base_model_path = os.path.dirname(base_model_path)
+
+        args.model.model_path = os.path.join(base_model_path, "transformer")
+        condition_cfg["base_model_path"] = base_model_path
+        condition_cfg["text_encoder_path"] = os.path.join(base_model_path, "text_encoder")
+        condition_cfg["tokenizer_path"] = os.path.join(base_model_path, "tokenizer")
+        condition_cfg["vae_path"] = os.path.join(base_model_path, "vae")
+
+        logger.info_rank0(
+            "Resolved Krea2 paths: "
+            f"model_path={args.model.model_path}, "
+            f"base_model_path={condition_cfg['base_model_path']}."
+        )
 
     def _build_condition_model(
         self,
@@ -350,9 +378,11 @@ class DiTTrainer:
                 extra = dataset_len % dp_size
                 valid_data_length = base_count + (1 if dp_rank < extra else 0)
                 logger.info(f"Rank {args.train.global_rank} data length to save: {valid_data_length}")
-                # shard_num 必须 >1:默认 1 会让每个 rank 把全程 embedding 攒在
-                # CPU 内存里、最后才一次性写 parquet,大数据集直接 OOM(SIGKILL)。
-                # 按每 shard ~500 样本增量 flush,buffer 峰值控制在几 GB / rank。
+                # Keep shard_num > 1 for large offline-embedding jobs. The
+                # default single shard buffers a whole rank's cache in CPU
+                # memory until the final parquet write, which can OOM on
+                # large datasets. Flushing roughly every 500 samples keeps the
+                # per-rank buffer bounded.
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
@@ -419,6 +449,8 @@ class DiTTrainer:
         self.base.on_train_begin()
 
     def on_train_end(self):
+        if self.training_task == "offline_embedding" and self.offline_embedding_saver is not None:
+            self.offline_embedding_saver.save_last()
         self.base.on_train_end()
 
     def on_epoch_begin(self):
