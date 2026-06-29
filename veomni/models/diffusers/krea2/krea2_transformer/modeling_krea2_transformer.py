@@ -11,8 +11,16 @@ from einops import rearrange
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from .....utils.import_utils import is_liger_kernel_available
+from .....utils.import_utils import is_liger_kernel_available, is_package_available
 from .configuration_krea2_transformer import Krea2TransformerModelConfig
+
+if is_package_available("triton"):
+    try:
+        from .....ops.kernels.rotary.triton_wan import ApplyRotaryEmb
+    except Exception:
+        ApplyRotaryEmb = None
+else:
+    ApplyRotaryEmb = None
 
 if is_liger_kernel_available():
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
@@ -36,15 +44,20 @@ def _get_1d_rotary_pos_embed(
         raise ValueError(f"Rotary dim must be even, got {dim}.")
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=freqs_dtype, device=pos.device) / dim))
     freqs = torch.outer(pos.to(dtype=freqs_dtype), freqs)
-    cos = freqs.cos().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
-    sin = freqs.sin().repeat_interleave(2, dim=1, output_size=freqs.shape[1] * 2).float()
+    cos = freqs.cos().float()
+    sin = freqs.sin().float()
     return cos, sin
 
 
 def _apply_rotary_emb(x: torch.Tensor, freqs_cis: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
     cos, sin = freqs_cis
-    cos = cos[None, :, None, :].to(device=x.device)
-    sin = sin[None, :, None, :].to(device=x.device)
+    cos = cos.to(device=x.device)
+    sin = sin.to(device=x.device)
+    if ApplyRotaryEmb is not None and x.is_cuda:
+        return ApplyRotaryEmb.apply(x, cos.contiguous(), sin.contiguous(), False)
+
+    cos = cos.repeat_interleave(2, dim=-1, output_size=cos.shape[-1] * 2)[None, :, None, :]
+    sin = sin.repeat_interleave(2, dim=-1, output_size=sin.shape[-1] * 2)[None, :, None, :]
     x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
     return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
