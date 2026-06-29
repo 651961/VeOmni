@@ -114,7 +114,7 @@ class OfflineEmbeddingSaver:
     def _flush_shard(self) -> None:
         ds = Dataset.from_list(self.buffer)
         path = os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet")
-        ds.to_parquet(path)
+        ds.to_parquet(path, compression="zstd", compression_level=3)
         self.buffer = []
         self.index += 1
 
