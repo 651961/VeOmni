@@ -84,6 +84,7 @@ bash train.sh tasks/train_dit.py \
     --train.accelerator.dp_shard_size 8 \
     --train.accelerator.ulysses_size 1 \
     --train.gradient_checkpointing.enable true \
+    --train.gradient_checkpointing.sac_policy attn_rotary_and_mlp \
     --train.num_train_epochs 10 \
     --train.wandb.enable true \
     --train.wandb.project Krea2-Image-Edit-SFT \
@@ -103,6 +104,18 @@ or pass a specific checkpoint directory:
 ```shell
 --train.checkpoint.load_path /path/to/checkpoints/krea2_image_edit_runs/checkpoints/global_step_<step>
 ```
+
+## Selective Activation Checkpointing
+
+`configs/dit/krea2_image_edit_sft.yaml` enables
+`train.gradient_checkpointing.sac_policy: attn_rotary_and_mlp` for the
+offline-training stage. This keeps the outputs of Krea2's SDPA attention,
+shared `veomni::rotary_interleaved_fwd` rotary custom op, and Linear matmuls
+live across the checkpoint boundary while recomputing the remaining cheap ops.
+
+The policy requires non-reentrant checkpointing, which is the VeOmni default
+(`train.gradient_checkpointing.enable_reentrant: false`). Set
+`VEOMNI_SAC_DEBUG=1` to print each unique MUST_SAVE op once on rank 0.
 
 ## Notes
 

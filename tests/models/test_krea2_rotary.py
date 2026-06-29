@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import veomni.models.diffusers.krea2.krea2_transformer.modeling_krea2_transformer as krea2
 from veomni.models.diffusers.krea2.krea2_transformer.modeling_krea2_transformer import (
     Krea2RotaryPosEmbed,
     _apply_rotary_emb,
@@ -88,6 +89,16 @@ def test_krea2_rotary_eager_matches_reference_cpu():
     expected = _reference_apply_rotary_emb(x, freqs_cis)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_krea2_rotary_custom_op_is_visible_to_sac_when_available():
+    if krea2.rotary_interleaved_fwd is None:
+        pytest.skip("Triton rotary custom op is unavailable")
+
+    from veomni.distributed import sac
+
+    rotary_ops = sac._collect_rotary_ops()
+    assert torch.ops.veomni.rotary_interleaved_fwd.default in rotary_ops
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the fused RoPE kernel")

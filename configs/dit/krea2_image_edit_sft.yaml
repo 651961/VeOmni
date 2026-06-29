@@ -38,7 +38,7 @@ train:
         enable: false
   gradient_checkpointing:
     enable: true
-    sac_policy: none
+    sac_policy: attn_rotary_and_mlp
   enable_compile: false
   global_batch_size: 128
   micro_batch_size: 1

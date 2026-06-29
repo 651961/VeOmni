@@ -155,12 +155,12 @@ class DiTTrainer:
         self.base._init_callbacks()
 
     def _maybe_compile_mlps(self):
-        # Compile each transformer block whole after FSDP wrap.  FA3
-        # (flash_attn_3::_flash_attn_forward) and the rotary triton kernel
-        # (veomni::rotary_interleaved_fwd) are both registered as torch
-        # custom_ops with fake meta + autograd, so dynamo can trace through
-        # the attn forward without graph breaks.  The outer gradient
-        # checkpoint still sees no compile, so loss matches eager exactly.
+        # Compile Qwen-Image-Edit transformer blocks whole after FSDP wrap.
+        # FA3 and the shared rotary triton kernel (veomni::rotary_interleaved_fwd)
+        # are registered as torch custom_ops with fake meta + autograd, so
+        # dynamo can trace through the attn forward without graph breaks. The
+        # outer gradient checkpoint still sees no compile, so loss matches eager
+        # exactly.
         if not self.base.args.train.enable_compile:
             return
         blocks = getattr(self.base.model, "transformer_blocks", None)

@@ -16,11 +16,11 @@ from .configuration_krea2_transformer import Krea2TransformerModelConfig
 
 if is_package_available("triton"):
     try:
-        from .....ops.kernels.rotary.triton_wan import ApplyRotaryEmb
+        from .....ops.kernels.rotary.triton_wan import rotary_interleaved_fwd
     except Exception:
-        ApplyRotaryEmb = None
+        rotary_interleaved_fwd = None
 else:
-    ApplyRotaryEmb = None
+    rotary_interleaved_fwd = None
 
 if is_liger_kernel_available():
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
@@ -59,8 +59,8 @@ def _apply_rotary_emb(x: torch.Tensor, freqs_cis: tuple[torch.Tensor, torch.Tens
     cos, sin = freqs_cis
     cos = cos.to(device=x.device)
     sin = sin.to(device=x.device)
-    if ApplyRotaryEmb is not None and x.is_cuda:
-        return ApplyRotaryEmb.apply(x, cos.contiguous(), sin.contiguous(), False)
+    if rotary_interleaved_fwd is not None and x.is_cuda:
+        return rotary_interleaved_fwd(x, cos.contiguous(), sin.contiguous())
 
     cos = cos.repeat_interleave(2, dim=-1, output_size=cos.shape[-1] * 2)[None, :, None, :]
     sin = sin.repeat_interleave(2, dim=-1, output_size=sin.shape[-1] * 2)[None, :, None, :]

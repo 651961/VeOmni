@@ -199,6 +199,40 @@ def apply_rotary_interleaved(
     return output
 
 
+@torch.library.custom_op("veomni::rotary_interleaved_fwd", mutates_args=())
+def rotary_interleaved_fwd(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return apply_rotary_interleaved(x, cos, sin, conjugate=False)
+
+
+@rotary_interleaved_fwd.register_fake
+def _rotary_interleaved_fwd_fake(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("veomni::rotary_interleaved_bwd", mutates_args=())
+def rotary_interleaved_bwd(grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return apply_rotary_interleaved(grad_out, cos, sin, conjugate=True)
+
+
+@rotary_interleaved_bwd.register_fake
+def _rotary_interleaved_bwd_fake(grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(grad_out)
+
+
+def _rotary_interleaved_setup_ctx(ctx, inputs, output):
+    _x, cos, sin = inputs
+    ctx.save_for_backward(cos, sin)
+
+
+def _rotary_interleaved_bwd(ctx, grad_out):
+    cos, sin = ctx.saved_tensors
+    grad_x = rotary_interleaved_bwd(grad_out, cos, sin)
+    return grad_x, None, None
+
+
+rotary_interleaved_fwd.register_autograd(_rotary_interleaved_bwd, setup_context=_rotary_interleaved_setup_ctx)
+
+
 class ApplyRotaryEmb(torch.autograd.Function):
     @staticmethod
     def forward(

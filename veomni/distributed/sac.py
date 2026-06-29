@@ -104,9 +104,9 @@ def _collect_attn_ops() -> set:
 def _collect_rotary_ops() -> set:
     """Return the fused interleaved-rotary forward overload, if registered.
 
-    The kernel is registered as ``veomni::rotary_interleaved_fwd`` from the
-    DiT modeling module on first import; resolving lazily mirrors the FA3
-    case so the policy still picks it up no matter the import order.
+    The kernel is registered as ``veomni::rotary_interleaved_fwd`` by the
+    shared rotary Triton module on first import; resolving lazily mirrors the
+    FA3 case so the policy still picks it up no matter the import order.
     """
     candidates = (("veomni", "rotary_interleaved_fwd"),)
     ops = set()

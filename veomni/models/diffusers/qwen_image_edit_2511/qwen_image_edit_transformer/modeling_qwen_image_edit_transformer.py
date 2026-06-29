@@ -58,7 +58,7 @@ from einops import rearrange
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from .....ops.kernels.rotary.triton_wan import ApplyRotaryEmb, apply_rotary_interleaved
+from .....ops.kernels.rotary.triton_wan import rotary_interleaved_fwd
 from .....utils import logging
 from .....utils.import_utils import is_liger_kernel_available
 from .configuration_qwen_image_edit_transformer import QwenImageEditTransformerModelConfig
@@ -79,17 +79,14 @@ _FLASH_ATTN_AVAILABLE = False
 _fa3_op_fwd = None
 
 # --------------------------------------------------------------------------- #
-# Dynamo-traceable wrappers for the rotary triton kernel and FA3 forward.
+# Dynamo-traceable attention wrapper.
 #
 # flash_attn_3::_flash_attn_forward is already registered upstream as a
 # torch.library.custom_op (with register_fake + register_autograd), so
 # calling it directly bypasses the FlashAttnFunc autograd.Function wrapper
-# (a dynamo black box) and lets dynamo trace the attention call.
-#
-# apply_rotary_interleaved (the triton kernel call) is wrapped below as
-# veomni::rotary_interleaved_fwd with a fake meta + autograd that mirrors
-# ApplyRotaryEmb's conjugate-pass.  dynamo treats this custom_op as
-# opaque, matching the original autograd.Function semantics.
+# (a dynamo black box) and lets dynamo trace the attention call. The rotary
+# triton custom op lives in ``ops.kernels.rotary.triton_wan`` so other DiT
+# models can share the same SAC-visible ``veomni::rotary_interleaved_fwd``.
 # --------------------------------------------------------------------------- #
 
 
@@ -110,54 +107,6 @@ def _fa3_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
         softmax_scale,
     )
     return out
-
-
-@torch.library.custom_op("veomni::rotary_interleaved_fwd", mutates_args=())
-def _rotary_interleaved_fwd_op(
-    x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    return apply_rotary_interleaved(x, cos, sin, conjugate=False)
-
-
-@_rotary_interleaved_fwd_op.register_fake
-def _rotary_interleaved_fwd_fake(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    return torch.empty_like(x)
-
-
-# Separate op for the reverse-direction (conjugate=True) triton call. Needed
-# because AOT autograd Python-calls the register_autograd backward during
-# joint-trace with FakeTensors, and a bare triton kernel call would try to
-# access .data_ptr() on the fakes.  Wrapping it as an opaque custom_op makes
-# AOT use the fake meta instead.
-@torch.library.custom_op("veomni::rotary_interleaved_bwd", mutates_args=())
-def _rotary_interleaved_bwd_op(
-    grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    return apply_rotary_interleaved(grad_out, cos, sin, conjugate=True)
-
-
-@_rotary_interleaved_bwd_op.register_fake
-def _rotary_interleaved_bwd_fake(
-    grad_out: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> torch.Tensor:
-    return torch.empty_like(grad_out)
-
-
-def _rotary_interleaved_setup_ctx(ctx, inputs, output):
-    _x, cos, sin = inputs
-    ctx.save_for_backward(cos, sin)
-
-
-def _rotary_interleaved_bwd(ctx, grad_out):
-    cos, sin = ctx.saved_tensors
-    grad_x = _rotary_interleaved_bwd_op(grad_out, cos, sin)
-    return grad_x, None, None
-
-
-_rotary_interleaved_fwd_op.register_autograd(
-    _rotary_interleaved_bwd, setup_context=_rotary_interleaved_setup_ctx
-)
-
 
 if is_liger_kernel_available():
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
@@ -318,7 +267,7 @@ def _apply_rotary_emb(x: torch.Tensor, freqs_cis) -> torch.Tensor:
     if isinstance(freqs_cis, tuple):
         cos, sin = freqs_cis
         x_bshd = x.transpose(1, 2)
-        out = _rotary_interleaved_fwd_op(x_bshd, cos, sin)
+        out = rotary_interleaved_fwd(x_bshd, cos, sin)
         return out.transpose(1, 2)
     x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
     x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
