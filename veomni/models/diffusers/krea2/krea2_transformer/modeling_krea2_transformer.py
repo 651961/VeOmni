@@ -11,7 +11,13 @@ from einops import rearrange
 from transformers import PreTrainedModel
 from transformers.utils import ModelOutput
 
+from .....utils.import_utils import is_liger_kernel_available
 from .configuration_krea2_transformer import Krea2TransformerModelConfig
+
+if is_liger_kernel_available():
+    from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+else:
+    LigerRMSNormFunction = None
 
 
 @dataclass
@@ -80,18 +86,6 @@ def _attention(
     return rearrange(out, "b h s d -> b s h d")
 
 
-# class Krea2RMSNorm(nn.Module):
-#     def __init__(self, dim: int, eps: float = 1e-5) -> None:
-#         super().__init__()
-#         self.dim = dim
-#         self.eps = eps
-#         self.weight = nn.Parameter(torch.zeros(dim))
-
-#     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-#         dtype = hidden_states.dtype
-#         hidden_states = F.rms_norm(hidden_states.float(), (self.dim,), weight=self.weight.float() + 1.0, eps=self.eps)
-#         return hidden_states.to(dtype)
-
 class Krea2RMSNorm(nn.Module):
     """RMSNorm with a zero-centered scale: the effective multiplier is `1 + weight`, matching the Krea 2 checkpoint
     format. The activations are upcast so the normalization runs in float32; the scale weight is kept in float32 by the
@@ -104,6 +98,16 @@ class Krea2RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if LigerRMSNormFunction is not None and hidden_states.is_cuda:
+            return LigerRMSNormFunction.apply(
+                hidden_states,
+                self.weight,
+                self.eps,
+                1.0,
+                "gemma",
+                False,
+                None,
+            )
         dtype = hidden_states.dtype
         hidden_states = F.rms_norm(hidden_states.float(), (self.dim,), weight=self.weight + 1.0, eps=self.eps)
         return hidden_states.to(dtype)
