@@ -24,8 +24,14 @@ else:
 
 if is_liger_kernel_available():
     from liger_kernel.ops.rms_norm import LigerRMSNormFunction
+
+    try:
+        from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+    except ImportError:
+        LigerSiLUMulFunction = None
 else:
     LigerRMSNormFunction = None
+    LigerSiLUMulFunction = None
 
 
 @dataclass
@@ -133,7 +139,13 @@ class Krea2SwiGLU(nn.Module):
         self.down = nn.Linear(hidden_dim, dim, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.down(F.silu(self.gate(hidden_states)) * self.up(hidden_states))
+        gate = self.gate(hidden_states)
+        up = self.up(hidden_states)
+        if LigerSiLUMulFunction is not None and hidden_states.is_cuda:
+            hidden_states = LigerSiLUMulFunction.apply(gate, up)
+        else:
+            hidden_states = F.silu(gate) * up
+        return self.down(hidden_states)
 
 
 class Krea2Attention(nn.Module):
