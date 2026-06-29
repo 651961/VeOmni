@@ -291,18 +291,51 @@ class Krea2TimestepEmbedding(nn.Module):
 
 
 class Krea2RotaryPosEmbed(nn.Module):
+    _DEFAULT_CACHE_LENGTH = 8192
+    _CACHE_LENGTH_GRANULARITY = 1024
+
     def __init__(self, theta: float, axes_dim: list[int]):
         super().__init__()
         self.theta = theta
         self.axes_dim = axes_dim
+        self._freqs_cache: dict[tuple[int, str, int | None, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _get_axis_freqs(
+        self,
+        axis_idx: int,
+        axis_dim: int,
+        ids: torch.Tensor,
+        freqs_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        device = ids.device
+        cache_key = (axis_idx, device.type, device.index, freqs_dtype)
+        cached = self._freqs_cache.get(cache_key)
+        cache_len = max(ids.shape[0], self._DEFAULT_CACHE_LENGTH)
+        cache_len = math.ceil(cache_len / self._CACHE_LENGTH_GRANULARITY) * self._CACHE_LENGTH_GRANULARITY
+
+        if cached is None or cached[0].shape[0] < cache_len:
+            table_pos = torch.arange(cache_len, dtype=torch.float32, device=device)
+            cached = _get_1d_rotary_pos_embed(axis_dim, table_pos, theta=self.theta, freqs_dtype=freqs_dtype)
+            self._freqs_cache[cache_key] = cached
+
+        axis_ids = ids[:, axis_idx].to(dtype=torch.long)
+        cos, sin = cached
+        return cos.index_select(0, axis_ids), sin.index_select(0, axis_ids)
 
     def forward(self, ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         cos_out = []
         sin_out = []
-        pos = ids.float()
         freqs_dtype = torch.float64 if ids.device.type not in ("mps", "npu") else torch.float32
         for i, axis_dim in enumerate(self.axes_dim):
-            cos, sin = _get_1d_rotary_pos_embed(axis_dim, pos[:, i], theta=self.theta, freqs_dtype=freqs_dtype)
+            if ids.is_floating_point():
+                cos, sin = _get_1d_rotary_pos_embed(
+                    axis_dim,
+                    ids[:, i].float(),
+                    theta=self.theta,
+                    freqs_dtype=freqs_dtype,
+                )
+            else:
+                cos, sin = self._get_axis_freqs(i, axis_dim, ids, freqs_dtype)
             cos_out.append(cos)
             sin_out.append(sin)
         return torch.cat(cos_out, dim=-1).to(ids.device), torch.cat(sin_out, dim=-1).to(ids.device)
