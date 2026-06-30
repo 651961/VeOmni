@@ -34,6 +34,7 @@ import warnings
 from abc import ABC
 from collections import defaultdict
 from dataclasses import asdict
+from datetime import timedelta
 from typing import Any, Callable, Dict, List
 
 import torch
@@ -322,7 +323,11 @@ class BaseTrainer(Stateful, ABC):
 
         # Initialize distributed process group
         if not dist.is_initialized():
-            dist.init_process_group(backend=get_dist_comm_backend())
+            init_kwargs = {"backend": get_dist_comm_backend()}
+            dist_timeout = os.getenv("VEOMNI_DIST_TIMEOUT", os.getenv("NCCL_TIMEOUT", "7200"))
+            init_kwargs["timeout"] = timedelta(seconds=int(dist_timeout))
+            logger.info_rank0(f"Process group timeout: {dist_timeout}s")
+            dist.init_process_group(**init_kwargs)
 
         logger.info(f"Process rank: {self.args.train.global_rank}, world size: {self.args.train.world_size}")
 
