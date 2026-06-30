@@ -127,6 +127,11 @@ The policy requires non-reentrant checkpointing, which is the VeOmni default
 - For Krea2, set `--model.model_path` to the Raw model root
   (`/path/to/Krea-2-Raw`). VeOmni derives `transformer`, `text_encoder`,
   `tokenizer`, and `vae` paths from that root.
+- Krea2 SFT samples training timesteps from the same resolution-aware
+  exponential-shift grid as the released Raw sampler. By default `mu` is derived
+  from the target latent token count using the `(256, 0.5)` to `(6400, 1.15)`
+  interpolation; set `model.condition_model_cfg.timestep_shift_mu` to pin a
+  constant value.
 - `micro_batch_size` is fixed to `1` by `DiTTrainer` for DiT tasks.
 - `configs/dit/krea2_image_edit_sft.yaml` defaults to `offline_training`; set
   `--train.training_task offline_embedding` explicitly when generating cache.

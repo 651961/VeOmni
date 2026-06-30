@@ -10,6 +10,11 @@ model:
     target_image_area: 1048576        # 1024 * 1024
     image_size_multiple: 32
     num_train_timesteps: 1000
+    timestep_shift_min_resolution: 256
+    timestep_shift_max_resolution: 1280
+    timestep_shift_y1: 0.5
+    timestep_shift_y2: 1.15
+    timestep_shift_mu: null
   ops_implementation:
     attn_implementation: sdpa
 

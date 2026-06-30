@@ -71,6 +71,37 @@ def _prepare_with_refs(target: torch.Tensor, refs: list[torch.Tensor], txtlen: i
     return img, pos, mask, target.shape[1]
 
 
+def _krea2_dynamic_mu(seq_len: int, x1: int, x2: int, y1: float, y2: float) -> float:
+    slope = (y2 - y1) / (x2 - x1)
+    return slope * seq_len + (y1 - slope * x1)
+
+
+def _krea2_shifted_timesteps(
+    seq_len: int,
+    steps: int,
+    x1: int,
+    x2: int,
+    y1: float,
+    y2: float,
+    mu: float | None = None,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Krea-2 RAW timestep shift used by the released inference sampler.
+
+    The official sampler builds a 1 -> 0 grid of length ``steps + 1``, shifts it
+    with resolution-derived ``mu``, and uses all but the terminal 0 during the
+    denoising loop. Training samples uniformly from that same shifted grid.
+    """
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=torch.float32)[:-1]
+    if mu is None:
+        mu = _krea2_dynamic_mu(seq_len, x1, x2, y1, y2)
+    exp_mu = math.exp(float(mu))
+    ts = exp_mu / (exp_mu + (1.0 / ts - 1.0))
+    return ts.to(dtype=dtype)
+
+
 class _Krea2QwenAutoencoder(nn.Module):
     """Qwen-Image VAE wrapper matching the official Krea-2 inference contract."""
 
@@ -227,14 +258,29 @@ class Krea2ConditionModel(PreTrainedModel):
 
         device = x.device
         dtype = x.dtype
-        timestep = torch.randint(
+        timestep_id = torch.randint(
             0,
             self.config.num_train_timesteps,
             (x.shape[0],),
             device=self.generator.device,
             generator=self.generator,
-        ).to(device=device, dtype=dtype)
-        timestep = timestep / float(self.config.num_train_timesteps)
+        )
+        target_seq_len = (x.shape[-2] // self.patch) * (x.shape[-1] // self.patch)
+        align = _Krea2QwenAutoencoder.compression * self.patch
+        x1 = (self.config.timestep_shift_min_resolution // align) ** 2
+        x2 = (self.config.timestep_shift_max_resolution // align) ** 2
+        timestep_grid = _krea2_shifted_timesteps(
+            target_seq_len,
+            self.config.num_train_timesteps,
+            x1,
+            x2,
+            self.config.timestep_shift_y1,
+            self.config.timestep_shift_y2,
+            self.config.timestep_shift_mu,
+            device=self.generator.device,
+            dtype=dtype,
+        )
+        timestep = timestep_grid[timestep_id].to(device=device)
         noise = torch.randn(x.shape, device=self.generator.device, dtype=dtype, generator=self.generator).to(device)
         x_t = (1.0 - timestep.view(-1, 1, 1, 1)) * x + timestep.view(-1, 1, 1, 1) * noise
         training_target = noise - x

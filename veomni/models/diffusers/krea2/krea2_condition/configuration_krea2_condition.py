@@ -21,6 +21,11 @@ class Krea2ConditionModelConfig(PretrainedConfig):
         reference_vae_image_area: int = 1024 * 1024,
         image_size_multiple: int = 32,
         num_train_timesteps: int = 1000,
+        timestep_shift_min_resolution: int = 256,
+        timestep_shift_max_resolution: int = 1280,
+        timestep_shift_y1: float = 0.5,
+        timestep_shift_y2: float = 1.15,
+        timestep_shift_mu: Optional[float] = None,
         seed: Optional[int] = 42,
         **kwargs,
     ):
@@ -35,6 +40,11 @@ class Krea2ConditionModelConfig(PretrainedConfig):
         self.reference_vae_image_area = reference_vae_image_area
         self.image_size_multiple = image_size_multiple
         self.num_train_timesteps = num_train_timesteps
+        self.timestep_shift_min_resolution = timestep_shift_min_resolution
+        self.timestep_shift_max_resolution = timestep_shift_max_resolution
+        self.timestep_shift_y1 = timestep_shift_y1
+        self.timestep_shift_y2 = timestep_shift_y2
+        self.timestep_shift_mu = timestep_shift_mu
         self.seed = seed
         super().__init__(**kwargs)
 
