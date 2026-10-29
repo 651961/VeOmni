@@ -16,15 +16,16 @@
 # -----------------------------------------------------------------------------
 model:
   # micro_batch_size > 1 packs samples inside H3; retain cast_forward_inputs=false below.
-  model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer
-  condition_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
-  config_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA/transformer/config.json
+  model_path: /ai_share/models/MiniMax-H3/FL2VA/transformer
+  condition_model_path: /ai_share/models/MiniMax-H3/FL2VA/transformer/config.json
+  config_path: /ai_share/models/MiniMax-H3/FL2VA/transformer/config.json
 
   condition_model_cfg:
-    base_model_path: pretrained_models/MiniMax-H3/MiniMax/MiniMax-H3/FL2VA
+    base_model_path: /ai_share/models/MiniMax-H3/FL2VA
     skip_encoder_load: true
     use_keyframe_condition: true
-    keyframe_indices: [0, -1]
+    keyframe_indices: [0]
+    training_cfg_scale: 4.0
     video_max_frames: 120
     video_max_resolution: 832
     sigma_shift_video: 12.0
@@ -52,6 +53,8 @@ model:
 
   accelerator:
     init_device: meta
+    dp_replicate_size: 1
+    dp_shard_size: 8
     ulysses_size: 1
     gradient_checkpointing:
       enable: true
@@ -70,7 +73,7 @@ model:
 # Data
 # -----------------------------------------------------------------------------
 data:
-  train_path: output/minimax_h3_fl2va_embedding
+  train_path: dataset/christmas_dance_fl2va_embedding
   data_type: diffusion
   source_name: minimax_h3
   data_transform: dit_offline
@@ -96,7 +99,7 @@ train:
   seed: 42
 
   num_train_epochs: 1
-  max_steps: 25
+  max_steps: 250
 
   profile:
       enable: false
@@ -110,10 +113,10 @@ train:
       rank0_only: true
 
   checkpoint:
-    output_dir: output/minimax_h3_fl2va_offline
-    save_steps: 500
+    output_dir: output/christmas_dance_fl2va
+    save_steps: 50
     save_epochs: 0
-    save_hf_weights: false
+    save_hf_weights: true
 
   wandb:
     enable: false

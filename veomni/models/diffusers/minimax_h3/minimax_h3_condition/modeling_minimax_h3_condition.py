@@ -356,6 +356,13 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             results["audio_cond_noise_aug"].append(cfg.audio_cond_noise_aug)
             results["has_audio"].append(has_audio)
 
+            if cfg.training_cfg_scale > 1:
+                paired = self.add_unconditional_cache(
+                    {"packed": packed, "prompt_embeds": prompt_embeds.cpu()}, keyframe_images=keyframe_images
+                )
+                for key in ("unconditional_prompt_embeds", "unconditional_packed"):
+                    results.setdefault(key, []).append(paired[key])
+
         return results
 
     def _encode_text(self, prompt: str, keyframe_images, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:

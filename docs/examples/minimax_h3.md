@@ -43,7 +43,7 @@ dataset/my_data/
 
 ### 2.2 metadata.csv Format
 
-The following 4 columns are **required**, with fixed column names:
+Only `video` and `prompt` are required:
 
 ```text
 video,prompt,input_audio,frame_rate
@@ -52,21 +52,31 @@ video.mp4,"A girl is very happy, she is speaking in english.",video.mp4,24
 
 | Column | Required | Meaning |
 |:---|:-----|:-----|
-| `video` | Yes | Video file name (relative to the CSV directory) |
+| `video` | Yes | Video file name (relative to `data.mm_configs.data_dir`) |
 | `prompt` | Yes | Text description (matches the video content) |
-| `input_audio` | Yes | Audio source; set to `video.mp4` to use the video's own audio track |
-| `frame_rate` | Yes | Frame rate; set to `24` |
+| `input_audio` | No | Audio source; omit for zero audio loss |
+| `frame_rate` | No | Metadata only; sampling FPS comes from `data.mm_configs.fps` |
+
+Use standard CSV quoting to preserve prompt newlines.
+
+For mixed aspect ratios, set `data.mm_configs.video_max_pixels: 1032192` instead
+of `height/width`: resize each video without cropping and align H/W to 32.
 
 ### 2.3 Hard Video Constraints (violations raise errors)
 
 | Constraint | Value | Notes |
 |:-----|:---|:-----|
 | Frame count | **124** (must satisfy `(num_frames-5) % 17 == 0`) | The Video VAE groups frames by 17; 124 is the demo-config value. 73, 107, 141, etc. are also legal (`(N-5) % 17 == 0`) |
-| Resolution | **480x832** (height x width) | Must be divisible by the VAE downsampling factor |
+| Resolution | Variable H/W | Both must be multiples of 32 (VAE downsampling + DiT patching) |
 | Frame rate | 24 | `fps: 24` in the config; audio latent length is computed as `num_frames/24*40` |
-| Audio | 32kHz stereo | Audio is resampled to 32kHz automatically; videos without audio fail during training |
+| Audio | Optional; 32kHz stereo | Omitted audio sets `has_audio=False` and zero audio loss |
 
 ## 3. Training (Two Stages, Step by Step)
+
+Set `model.condition_model_cfg.training_cfg_scale > 1` in both stages to generate
+and use CFG negative caches (single-space prompt, same keyframes).
+For first-frame-only training, set `keyframe_indices: [0]` in both
+`model.condition_model_cfg` and `data.mm_configs`.
 
 ### Step 1: Run Stage 1 (offline embedding)
 
@@ -131,15 +141,14 @@ data:
     fps: 24
     min_frames: 124
     max_frames: 124
-    height: 480
-    width: 832
+    video_max_pixels: 1032192               # preserve aspect ratio, align H/W to 32
   offline_embedding_save_dir: output/minimax_h3_fl2va_embedding   # Stage 2 reads from here
 ```
 
 **Important**:
 
 - `train_path` must point to the **metadata.csv file** (or a directory that contains it). Directories are scanned for `parquet` / `json` / `csv` / `arrow` files only, so leftover images or `veomni_cli.yaml` are ignored.
-- When changing data, `fps/min_frames/max_frames/height/width` must match the actual video parameters; the frame count must satisfy `(N-5) % 17 == 0`
+- Set `fps/min_frames/max_frames` for your clips and `video_max_pixels` for the resolution budget; frame counts must satisfy `(N-5) % 17 == 0`.
 - `offline_embedding_save_dir` must match Stage 2's `data.train_path`
 
 ### Stage 2 Config (offline training)

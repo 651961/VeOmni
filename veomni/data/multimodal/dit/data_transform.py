@@ -1,7 +1,7 @@
 import PIL
 
 from ...data_transform import DATA_TRANSFORM_REGISTRY
-from ..image_utils import fetch_images
+from ..image_utils import fetch_images, smart_resize
 from ..preprocess import conv_preprocess
 from ..video_utils import fetch_videos
 
@@ -28,7 +28,8 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
 
     LoadVideo + ImageCropAndResize + LoadAudioWithTorchaudio steps:
       - video: imageio reader, fix_frame_rate=True (24fps), num_frames = min_frames
-        (17n+5), bilinear resize + center crop to (height, width), frames → float32
+        (17n+5), resize with video_max_pixels (aspect ratio, 32-aligned) or
+        bilinear resize + center crop to (height, width), frames → float32
         [0,1] tensors [3,H,W] (preprocess_video torch_dtype=float32, min_value=0)
       - audio: torchaudio.load, trim/pad to int(num_frames/24 * original_sr) at
         ORIGINAL sample rate, return (waveform[C,T], sample_rate)
@@ -46,6 +47,19 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
     height = int(kwargs.get("height", 480))
     width = int(kwargs.get("width", 832))
     frame_rate = float(kwargs.get("fps", 24))
+
+    def resize_frame(raw_frame):
+        img = PIL.Image.fromarray(raw_frame)
+        if kwargs.get("video_max_pixels") is not None:
+            return smart_resize(img, scale_factor=32, image_max_pixels=kwargs["video_max_pixels"])
+        w, h = img.size
+        scale = max(width / w, height / h)
+        img = TF.resize(
+            img,
+            (round(h * scale), round(w * scale)),
+            interpolation=TF.InterpolationMode.BILINEAR,
+        )
+        return TF.center_crop(img, (height, width))
 
     frames = []
     n_frames = num_frames
@@ -79,31 +93,12 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
             ptr = 0
             for j, raw_frame in enumerate(reader.iter_data()):
                 while ptr < n_frames and desired[ptr] <= j:
-                    img = PIL.Image.fromarray(raw_frame)
-                    # ImageCropAndResize(height, width)
-                    w, h = img.size
-                    scale = max(width / w, height / h)
-                    img = TF.resize(
-                        img,
-                        (round(h * scale), round(w * scale)),
-                        interpolation=TF.InterpolationMode.BILINEAR,
-                    )
-                    img = TF.center_crop(img, (height, width))
-                    frames.append(img)
+                    frames.append(resize_frame(raw_frame))
                     ptr += 1
                 last_raw_frame = raw_frame
             # Indices beyond the stream end clamp to the last decoded frame.
             while frames and ptr < n_frames:
-                img = PIL.Image.fromarray(last_raw_frame)
-                w, h = img.size
-                scale = max(width / w, height / h)
-                img = TF.resize(
-                    img,
-                    (round(h * scale), round(w * scale)),
-                    interpolation=TF.InterpolationMode.BILINEAR,
-                )
-                img = TF.center_crop(img, (height, width))
-                frames.append(img)
+                frames.append(resize_frame(last_raw_frame))
                 ptr += 1
         finally:
             reader.close()
