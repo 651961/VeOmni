@@ -22,7 +22,7 @@ multiply by freqs). Each variant registers an eager row plus optional CUDA /
 NPU adapters. ``full`` and ``partial`` also expose ``liger_kernel``.
 """
 
-from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
 from .deepseek_v4 import eager as dsv4_eager
 from .deepseek_v4 import triton as dsv4_triton
@@ -33,6 +33,7 @@ from .interleave import eager as interleave_eager
 from .mrope import eager as mrope_eager
 from .partial import eager as partial_eager
 from .partial import liger_kernel as partial_liger
+from .partial import quack as partial_quack
 from .partial import torch_npu as partial_npu
 from .wan import eager as wan_eager
 from .wan import torch_npu as wan_npu
@@ -197,4 +198,14 @@ register_op(
     wan_npu.backward,
     description="torch_npu Wan rotary embedding using complex multiplication",
     requirement=NpuKernelRequirement(),
+)
+
+register_op(
+    "rope",
+    "partial",
+    "quack",
+    wrapper=partial_quack.wrapper,
+    description="Quack partial RoPE with shared duplicated-half tables",
+    requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
+    requires=("quack.rotary",),
 )

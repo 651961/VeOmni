@@ -106,12 +106,16 @@ What Stage 2 does:
 
 ## 4. Training Config Notes
 
-Two config files:
+GPU training uses Quack RMSNorm and partial RoPE, matching verl-omni H3 ART
+(validated with `quack-kernels==0.5.0` on A800). Attention uses FlashAttention 2.
+
+Available configs:
 
 | Stage | Config | Training task |
 |:-----|:-----|:---------|
 | Stage 1 | `configs/dit/minimax_h3_fl2va_embedding.yaml` | `training_task: offline_embedding` |
 | Stage 2 | `configs/dit/minimax_h3_fl2va_offline.yaml` | `training_task: offline_training` |
+| Stage 2 (LoRA) | `configs/dit/minimax_h3_fl2va_lora_offline.yaml` | `training_task: offline_training` |
 
 ### Stage 1 Config (embedding)
 

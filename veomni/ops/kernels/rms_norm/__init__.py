@@ -21,10 +21,11 @@ fp32 affine scale), ``offset`` (offset 1, gemma-style fp32 scale), and
 registers an eager row plus optional CUDA / NPU adapters.
 """
 
-from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement
+from ...platform import GpuKernelRequirement, MluKernelRequirement, NpuKernelRequirement, NvidiaGpuPlatform
 from ...registry import register_op
 from .deepseek_v4 import eager as deepseek_v4_eager
 from .deepseek_v4 import liger_kernel as deepseek_v4_liger
+from .deepseek_v4 import quack as deepseek_v4_quack
 from .deepseek_v4 import torch_npu as deepseek_v4_npu
 from .offset import eager as offset_eager
 from .offset import liger_kernel as offset_liger
@@ -215,4 +216,14 @@ register_op(
     requirement=_MLU,
     requires=("liger_kernel",),
     default=True,
+)
+
+register_op(
+    "rms_norm",
+    "deepseek_v4",
+    "quack",
+    wrapper=deepseek_v4_quack.wrapper,
+    description="Quack affine RMSNorm",
+    requirement=GpuKernelRequirement(platforms=(NvidiaGpuPlatform(min_cc=80),)),
+    requires=("quack.rmsnorm",),
 )

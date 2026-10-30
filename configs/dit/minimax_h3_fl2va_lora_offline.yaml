@@ -1,0 +1,83 @@
+# H3 FL2VA LoRA: first-frame conditioning, offline CFG caches, 8-GPU FSDP2.
+model:
+  model_path: /ai_share/models/MiniMax-H3/FL2VA/transformer
+  condition_model_path: /ai_share/models/MiniMax-H3/FL2VA/transformer/config.json
+  config_path: /ai_share/models/MiniMax-H3/FL2VA/transformer/config.json
+  condition_model_cfg:
+    base_model_path: /ai_share/models/MiniMax-H3/FL2VA
+    skip_encoder_load: true
+    use_keyframe_condition: true
+    keyframe_indices: [0]
+    training_cfg_scale: 4.0
+    video_max_frames: 120
+    video_max_resolution: 832
+    sigma_shift_video: 12.0
+    sigma_shift_audio: 3.0
+    imgvid_cond_noise_aug: 0.999
+    audio_cond_noise_aug: 1.0
+  lora_config:
+    rank: 32
+    alpha: 32
+    lora_dropout: 0.0
+    lora_modules: dit\.blocks\.\d+\.(attn\.(qkv_proj|out_proj)|mlp\.(fc1|fc2))
+
+  ops_implementation:
+    attn_implementation: flash_attention_2
+    rotary_pos_emb_implementation: quack
+    rms_norm_implementation: quack
+    swiglu_mlp_implementation: eager
+    cross_entropy_loss_implementation: eager
+    moe_implementation: eager
+    load_balancing_loss_implementation: eager
+  optimizer:
+    type: adamw
+    lr: 1.0e-04
+    betas: [0.9, 0.999]
+    lr_decay_style: linear
+    lr_min: 1.0e-04
+    lr_warmup_ratio: 0.01
+    weight_decay: 0.01
+  accelerator:
+    init_device: meta
+    dp_replicate_size: 1
+    dp_shard_size: 8
+    ulysses_size: 1
+    gradient_checkpointing:
+      enable: true
+    fsdp_config:
+      fsdp_mode: fsdp2
+      mixed_precision:
+        enable: true
+        param_dtype: bfloat16
+        reduce_dtype: float32
+        cast_forward_inputs: false
+
+data:
+  train_path: dataset/christmas_dance_fl2va_embedding
+  data_type: diffusion
+  source_name: minimax_h3
+  data_transform: dit_offline
+  datasets_type: iterable
+  dataset_repeat: true
+  log_sample: false
+  text_keys: text
+  dataloader:
+    type: native
+    num_workers: 4
+    drop_last: true
+train:
+  training_task: offline_training
+  global_batch_size: 8
+  micro_batch_size: 1
+  dyn_bsz: false
+  seed: 42
+  num_train_epochs: 1
+  max_steps: 250
+  checkpoint:
+    output_dir: output/christmas_dance_fl2va_lora
+    save_steps: 50
+    save_epochs: 0
+    save_hf_weights: true
+  wandb:
+    enable: false
+    project: minimax_h3_fl2va_lora
