@@ -34,8 +34,6 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
       - audio: torchaudio.load, trim/pad to int(num_frames/24 * original_sr) at
         ORIGINAL sample rate, return (waveform[C,T], sample_rate)
     """
-    import math
-
     import imageio
     import numpy as np
     import torch
@@ -137,6 +135,108 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
         "videos": frames_t,
     }
     return [processed_example]
+
+
+@DATA_TRANSFORM_REGISTRY.register("minimax_h3_refinement_online")
+def process_minimax_h3_refinement_online_example(example, source_name, **kwargs):
+    """Load paired videos for LongCat-style H3 refinement training.
+
+    The target is resized with the configured pixel budget.  The low-quality
+    input is then resized in RGB to exactly that target geometry before VAE
+    encoding, matching LongCat's ``Decode -> Upsample -> Encode`` path.
+    """
+    import math
+
+    import imageio
+    import numpy as np
+    import torch
+    import torchvision.transforms.functional as TF
+
+    parsed = conv_preprocess(source=source_name, conversations=example, **kwargs)
+    if len(parsed) != 5:
+        raise ValueError("minimax_h3_refinement preprocessor must return target and input video paths")
+    prompt, audios, _, target_videos, input_videos = parsed
+    if not target_videos or not input_videos:
+        raise ValueError("Refinement samples require target and input videos")
+
+    num_frames = int(kwargs.get("min_frames", 124))
+    frame_rate = float(kwargs.get("fps", 24))
+    target_path, input_path = target_videos[0], input_videos[0]
+
+    def read_frames(path):
+        reader = imageio.get_reader(path)
+        frames = []
+        try:
+            meta = reader.get_meta_data()
+            raw_fps = float(meta.get("fps", frame_rate))
+            desired = [int(round(i / frame_rate * raw_fps)) for i in range(num_frames)]
+            ptr = 0
+            last = None
+            for index, raw in enumerate(reader.iter_data()):
+                last = raw
+                while ptr < num_frames and desired[ptr] <= index:
+                    frames.append(raw)
+                    ptr += 1
+            while ptr < num_frames and last is not None:
+                frames.append(last)
+                ptr += 1
+        finally:
+            reader.close()
+        if len(frames) < 5:
+            raise ValueError(f"Video has only {len(frames)} usable frames; H3 requires at least 5")
+        return frames
+
+    target_raw = read_frames(target_path)
+    input_raw = read_frames(input_path)
+
+    target_pil = [PIL.Image.fromarray(frame) for frame in target_raw]
+    if kwargs.get("video_max_pixels") is not None:
+        first = smart_resize(target_pil[0], scale_factor=32, image_max_pixels=kwargs["video_max_pixels"])
+        target_hw = first.height, first.width
+        target_pil = [
+            smart_resize(frame, scale_factor=32, image_max_pixels=kwargs["video_max_pixels"])
+            if frame.size != first.size
+            else frame
+            for frame in target_pil
+        ]
+        # smart_resize is aspect-aware; enforce one geometry for the clip.
+        target_pil = [
+            TF.resize(frame, target_hw, interpolation=TF.InterpolationMode.BICUBIC)
+            if frame.size != first.size
+            else frame
+            for frame in target_pil
+        ]
+    else:
+        height = int(kwargs.get("height", 768))
+        width = int(kwargs.get("width", 1344))
+        target_hw = (height, width)
+        target_pil = [TF.resize(frame, target_hw, interpolation=TF.InterpolationMode.BICUBIC) for frame in target_pil]
+
+    input_pil = [
+        TF.resize(PIL.Image.fromarray(frame), target_hw, interpolation=TF.InterpolationMode.BILINEAR)
+        for frame in input_raw
+    ]
+    # H3 FL2VA refinement keeps the target keyframe in the upsampled input
+    # sequence as well as in the separate keyframe condition rows.  Replace
+    # before VAE encoding so the temporal VAE sees the same RGB first frame.
+    input_pil[0] = target_pil[0].copy()
+
+    def to_tensor(frames):
+        return [torch.tensor(np.asarray(frame), dtype=torch.float32).permute(2, 0, 1) / 255.0 for frame in frames]
+
+    # Keyframes are selected by the condition model from this target video,
+    # matching ordinary H3 FL2VA SFT.  The input video remains available as
+    # the separate refinement source and is never used as a target keyframe.
+    return [
+        {
+            "inputs": prompt,
+            "audios": None,
+            "images": [],
+            "keyframe_indices": [0],
+            "videos": to_tensor(target_pil),
+            "input_videos": to_tensor(input_pil),
+        }
+    ]
 
 
 @DATA_TRANSFORM_REGISTRY.register("dit_offline")

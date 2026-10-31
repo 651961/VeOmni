@@ -721,6 +721,58 @@ def test_mixed_tasks_and_keyframes_match_serial():
         torch.testing.assert_close(p.grad, q.grad, rtol=2e-4, atol=2e-5, msg=name)
 
 
+@pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
+def test_get_condition_generates_paired_cfg_caches(monkeypatch, cfg_scale):
+    import pickle
+
+    from veomni.data.multimodal.dit.data_transform import process_dit_offline_example
+    from veomni.models.diffusers.minimax_h3.minimax_h3_core import minimax_h3_text_encoder as text
+
+    calls = []
+
+    def encode(encoder, processor, tokenizer, prompt, **kwargs):
+        calls.append((prompt, kwargs["keyframes"]))
+        length = 2 if prompt == " " else 5
+        return {"prompt_embeds": torch.ones(length, 32), "text_token_tags": torch.ones(length, dtype=torch.long)}
+
+    monkeypatch.setattr(text, "encode_prompt", encode)
+    cond = MiniMaxH3ConditionModel(
+        MiniMaxH3ConditionModelConfig(
+            skip_encoder_load=True, num_train_timesteps=16, keyframe_indices=[0], training_cfg_scale=cfg_scale
+        )
+    )
+    cond._video_vae = torch.nn.Linear(1, 1)
+    cond._text_encoder = torch.nn.Linear(1, 1)
+    cond._tokenizer = object()
+    monkeypatch.setattr(cond, "_encode_video", lambda video, device: torch.ones(1, 24, 2, 4, 6))
+    monkeypatch.setattr(cond, "_make_silent_audio_latent", lambda frames, device: torch.zeros(2, 32, 3))
+    monkeypatch.setattr(cond, "_encode_keyframe_cond", lambda images, device, latent_t: torch.ones(6, 96))
+    frames = [torch.zeros(3, 8, 8)] * 22
+    images = [[object()], [object()]]
+    encoded = cond.get_condition(
+        inputs=["first", "second"], videos=[frames, frames], images=images, keyframe_indices=[[0], [0]]
+    )
+    assert encoded["has_audio"] == [False, False]
+    if cfg_scale == 1:
+        assert "unconditional_prompt_embeds" not in encoded
+        assert "unconditional_packed" not in encoded
+        assert calls == [("first", images[0]), ("second", images[1])]
+    else:
+        assert calls == [("first", images[0]), (" ", images[0]), ("second", images[1]), (" ", images[1])]
+        assert [pk["text_len"] for pk in encoded["unconditional_packed"]] == [2, 2]
+        assert all(prompt.device.type == "cpu" for prompt in encoded["unconditional_prompt_embeds"])
+
+    model = tiny_model()
+    for index in range(2):
+        sample = {key: values[index] for key, values in encoded.items()}
+        restored = process_dit_offline_example({key: pickle.dumps(value) for key, value in sample.items()})[0]
+        inputs = prepare(cond, [restored])[0]
+        assert ("unconditional_inputs" in inputs) == (cfg_scale > 1)
+        losses = model(**inputs).loss
+        assert losses["mse_audio"].item() == 0
+        assert torch.isfinite(losses["mse_video"])
+
+
 def test_get_condition_flags_silent_audio_placeholder(monkeypatch):
     cond = MiniMaxH3ConditionModel(
         MiniMaxH3ConditionModelConfig(skip_encoder_load=True, num_train_timesteps=16, use_keyframe_condition=False)
@@ -1139,3 +1191,42 @@ def test_invalid_precision_and_legacy_tail_fail_closed():
         prepare(condition_model(), [row])
     with pytest.raises(ValueError, match="nonempty"):
         model(x=[])
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_quack_cfg_checkpoint_forward_backward(dtype):
+    """Native-width H3 RoPE and RMSNorm retain CFG and silent-audio gradients."""
+    from veomni.ops import VeomniOp
+    from veomni.utils.device import IS_CUDA_AVAILABLE
+
+    if not IS_CUDA_AVAILABLE:
+        pytest.skip("Quack requires CUDA")
+    pytest.importorskip("quack.rotary")
+    torch.manual_seed(19)
+    config = tiny_model().config
+    config.attention_head_dim = 128
+    config.rope_inv_freq_len = 16
+    base = MiniMaxH3DiTModel(config).to(device="cuda", dtype=dtype)
+    fused = copy.deepcopy(base)
+    for module in fused.modules():
+        if hasattr(module, "veomni_rms_norm"):
+            module.veomni_rms_norm = VeomniOp("rms_norm", "deepseek_v4", "quack")
+        if hasattr(module, "veomni_rope"):
+            module.veomni_rope = VeomniOp("rope", "partial", "quack")
+    fused.gradient_checkpointing_enable({"use_reentrant": False})
+    row = cfg_raw(task="fl2va")
+    row["has_audio"] = False
+    sample = prepare(cfg_condition(), [row])[0]
+    from torch.utils._pytree import tree_map
+
+    sample = tree_map(lambda x: x.to("cuda") if isinstance(x, torch.Tensor) else x, sample)
+    with torch.autocast("cuda", dtype=dtype, enabled=dtype == torch.bfloat16):
+        expected, actual = base(**sample), fused(**sample)
+    tolerance = dict(atol=0.01, rtol=0.04) if dtype == torch.bfloat16 else dict(atol=2e-5, rtol=3e-4)
+    torch.testing.assert_close(actual.loss, expected.loss, **tolerance)
+    assert actual.loss["mse_audio"].item() == 0
+    sum(actual.loss.values()).backward()
+    sum(expected.loss.values()).backward()
+    for (name, p), (_, q) in zip(base.named_parameters(), fused.named_parameters()):
+        if p.grad is not None:
+            torch.testing.assert_close(p.grad, q.grad, **tolerance, msg=name)

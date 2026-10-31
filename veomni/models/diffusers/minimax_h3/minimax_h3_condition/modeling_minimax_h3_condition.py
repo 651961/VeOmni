@@ -225,6 +225,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         self,
         inputs: list[str],
         videos: list[list[torch.Tensor]],
+        input_videos: list[list[torch.Tensor]] | None = None,
         audios: list | None = None,
         images: list | None = None,
         **kwargs,
@@ -240,6 +241,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         Returns:
           prompt_embeds: list[tensor [L, 5120]]
           input_latents: list[tensor [1, 24, T_v, H_lat, W_lat]]
+          refinement_input_latents: list[tensor [1, 24, T_v, H_lat, W_lat]] or None
           audio_input_latents: list[tensor [C, 32, T_a]]
           keyframe_cond_anchor: list[tensor [cond_rows, 96]] or None
           packed: list[dict]
@@ -253,6 +255,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         results = {
             "prompt_embeds": [],
             "input_latents": [],
+            "refinement_input_latents": [],
             "audio_input_latents": [],
             "keyframe_cond_anchor": [],
             "packed": [],
@@ -267,26 +270,30 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             video_frames = videos[i]
             num_frames = len(video_frames)
 
+            if self.config.refinement_mode:
+                if input_videos is None or i >= len(input_videos) or not input_videos[i]:
+                    raise ValueError("refinement_mode requires paired `input_videos` for every sample")
+                if len(input_videos[i]) != num_frames:
+                    raise ValueError(
+                        f"Refinement input/target frame counts differ: {len(input_videos[i])} vs {num_frames}"
+                    )
+
             # 1. Validate frame count for VAE temporal grouping
             if num_frames % _MINIMAX_H3_TIME_DIVISION_FACTOR != _MINIMAX_H3_TIME_DIVISION_REMAINDER:
                 raise ValueError(f"Sample {i}: num_frames={num_frames}, expected 17n+5 (e.g. 73)")
 
-            # 2. Extract keyframes from video (FL2VA: first + last frame)
-            # Prefer transform-provided PIL keyframes (native uint8, exact match
-            # with keyframes = data["video"][0/-1]); fall back to
-            # rebuilding from frame tensors only when the transform lacks them.
+            # 2. Extract keyframes from the target video (FL2VA: first + last
+            # frame).  They are always rebuilt from ``videos`` so no external
+            # image can silently become a condition source.
             if cfg.use_keyframe_condition and cfg.keyframe_indices:
-                if images is not None and i < len(images) and images[i]:
-                    keyframe_images = list(images[i])
-                else:
-                    from PIL import Image
+                from PIL import Image
 
-                    keyframe_images = []
-                    for idx in cfg.keyframe_indices:
-                        frame_tensor = video_frames[idx]
-                        if frame_tensor.dim() == 3:
-                            frame_np = (frame_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
-                            keyframe_images.append(Image.fromarray(frame_np))
+                keyframe_images = []
+                for idx in cfg.keyframe_indices:
+                    frame_tensor = video_frames[idx]
+                    if frame_tensor.dim() == 3:
+                        frame_np = (frame_tensor.permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                        keyframe_images.append(Image.fromarray(frame_np))
             else:
                 keyframe_images = None
 
@@ -296,6 +303,19 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             # 4. Encode video (VAE)
             video_tensor = torch.stack(video_frames).permute(1, 0, 2, 3).unsqueeze(0)  # [1,3,T,H,W]
             input_latent = self._encode_video(video_tensor, device)
+            refinement_input_latent = None
+            if self.config.refinement_mode:
+                input_video_tensor = torch.stack(input_videos[i]).permute(1, 0, 2, 3).unsqueeze(0)
+                if input_video_tensor.shape[-2:] != video_tensor.shape[-2:]:
+                    raise ValueError(
+                        "Refinement input must already be RGB-upsampled to the target geometry before VAE encoding"
+                    )
+                refinement_input_latent = self._encode_video(input_video_tensor, device)
+                if refinement_input_latent.shape != input_latent.shape:
+                    raise ValueError(
+                        f"Refinement latent geometry mismatch: input={tuple(refinement_input_latent.shape)} "
+                        f"target={tuple(input_latent.shape)}"
+                    )
 
             # 5. Encode audio (VAE)
             has_audio = audios is not None and i < len(audios) and audios[i] is not None
@@ -342,13 +362,14 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
                 latent_h=H_lat,
                 latent_w=W_lat,
                 audio_t=T_a,
-                keyframe_indices=cfg.keyframe_indices if cfg.use_keyframe_condition else [],
+                keyframe_indices=cfg.keyframe_indices if keyframe_cond_anchor is not None else [],
                 audio_channel=audio_ch,
                 text_token_tags=text_token_tags,
             )
 
             results["prompt_embeds"].append(prompt_embeds)
             results["input_latents"].append(input_latent)
+            results["refinement_input_latents"].append(refinement_input_latent)
             results["audio_input_latents"].append(audio_latent)
             results["keyframe_cond_anchor"].append(keyframe_cond_anchor)
             results["packed"].append(packed)
@@ -549,6 +570,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         audio_input_latents: list[torch.Tensor],
         prompt_embeds: list[torch.Tensor],
         packed: list[dict],
+        refinement_input_latents: list[torch.Tensor | None] | None = None,
         keyframe_cond_anchor: list[torch.Tensor | None] | None = None,
         imgvid_cond_noise_aug: float = 0.999,
         audio_cond_noise_aug: float = 1.0,
@@ -579,10 +601,21 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             audio_cond_noise_aug = audio_cond_noise_aug[0]
         # Caches written before has_audio existed supervise audio as before.
         has_audio = True if not has_audio or has_audio[0] is None else bool(has_audio[0])
+        cfg = self.config
 
         if ref_audio_anchor is not None and any(anchor is not None for anchor in ref_audio_anchor):
             raise NotImplementedError("Ref2VA audio references are not supported.")
         clean_video = input_latents[0]
+        refinement_input = None
+        if cfg.refinement_mode:
+            if not refinement_input_latents or refinement_input_latents[0] is None:
+                raise ValueError("refinement_mode requires cached refinement_input_latents")
+            refinement_input = refinement_input_latents[0].to(device=clean_video.device, dtype=clean_video.dtype)
+            if refinement_input.shape != clean_video.shape:
+                raise ValueError(
+                    f"Refinement input/target latent shapes differ: {tuple(refinement_input.shape)} "
+                    f"vs {tuple(clean_video.shape)}"
+                )
         clean_audio = audio_input_latents[0]
         prompt = prompt_embeds[0]
         pk = packed[0]
@@ -600,28 +633,46 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
         device = clean_video.device
         dtype = clean_video.dtype
 
-        cfg = self.config
         seq_len = pk["seq_len"]
         audio_ch = pk["audio_channel"]
 
-        # 1. Sample timestep
-        timestep_id_int = int(torch.randint(0, cfg.num_train_timesteps, (1,), device=device).item())
-        # Match the precision path: timestep = scheduler.timesteps[id].to(dtype=model_dtype),
-        # passed directly to scheduler.add_noise() / scheduler.training_weight().
-        # Lower dtype precision (e.g. bfloat16) shifts the argmin index used by add_noise
-        # and training_weight, changing the effective sigma and weight.
+        # 1. Sample timestep and construct the training path.  Refinement uses
+        # LongCat's truncated flow path: x_thresh is the 50% noised RGB-upsample
+        # latent, then t' is sampled uniformly between the clean target and
+        # x_thresh.  The target is scaled by 1/t_thresh as in Eq. (14).
         model_dtype = clean_video.dtype
-        ts_v = self._scheduler_video.timesteps[timestep_id_int].to(dtype=model_dtype)
-        ts_a = self._scheduler_audio.timesteps[timestep_id_int].to(dtype=model_dtype)
+        if cfg.refinement_mode:
+            t_thresh = float(cfg.refinement_t_thresh)
+            t_prime = torch.rand((), device=device, dtype=torch.float32) * t_thresh
+            video_noise = torch.randn_like(clean_video)
+            x_thresh = (1.0 - t_thresh) * refinement_input + t_thresh * video_noise
+            ratio = (t_prime / t_thresh).to(dtype=model_dtype)
+            video_noised = clean_video + (x_thresh - clean_video) * ratio
+            # H3's DiT wrapper stores the negative of the paper's velocity
+            # target (see _finish_outputs/model_fn_minimax_h3).
+            training_target = (x_thresh - clean_video) / t_thresh
+            # H3 uses denoising-time t = 1 - sigma.  t'=0 is clean (t=1),
+            # while t'=t_thresh is the refinement start point.
+            t_video = 1.0 - float(t_prime.item())
+            timestep_id_int = int(
+                round(float(t_prime.item()) * (self._scheduler_video.num_train_timesteps - 1))
+            )
+            timestep_id_int = max(0, min(self._scheduler_video.num_train_timesteps - 1, timestep_id_int))
+            ts_v = self._scheduler_video.timesteps[timestep_id_int].to(dtype=model_dtype)
+            ts_a = self._scheduler_audio.timesteps[timestep_id_int].to(dtype=model_dtype)
+        else:
+            timestep_id_int = int(torch.randint(0, cfg.num_train_timesteps, (1,), device=device).item())
+            # Match the precision path: timestep = scheduler.timesteps[id].to(dtype=model_dtype),
+            # passed directly to scheduler.add_noise() / scheduler.training_weight().
+            ts_v = self._scheduler_video.timesteps[timestep_id_int].to(dtype=model_dtype)
+            ts_a = self._scheduler_audio.timesteps[timestep_id_int].to(dtype=model_dtype)
+            t_video = 1.0 - ts_v.float().item() / self._scheduler_video.num_train_timesteps
 
-        # t = 1.0 - timestep / num_train_timesteps
-        t_video = 1.0 - ts_v.float().item() / self._scheduler_video.num_train_timesteps
+            video_noise = torch.randn_like(clean_video)
+            video_noised = self._scheduler_video.add_noise(clean_video, video_noise, ts_v)
+            training_target = self._scheduler_video.training_target(clean_video, video_noise, ts_v)
+
         t_audio = 1.0 - ts_a.float().item() / self._scheduler_audio.num_train_timesteps
-
-        # 2. Add noise + compute velocity target
-        video_noise = torch.randn_like(clean_video)
-        video_noised = self._scheduler_video.add_noise(clean_video, video_noise, ts_v)
-        training_target = self._scheduler_video.training_target(clean_video, video_noise, ts_v)
 
         audio_noise = torch.randn_like(clean_audio)
         audio_noised = self._scheduler_audio.add_noise(clean_audio, audio_noise, ts_a)

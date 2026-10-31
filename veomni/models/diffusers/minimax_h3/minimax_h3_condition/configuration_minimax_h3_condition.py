@@ -28,6 +28,8 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         training_cfg_scale: float = 1.0,
         training_cfg_schedule: str = "constant",
         training_cfg_curvature_power: float = 2.0,
+        refinement_mode: bool = False,
+        refinement_t_thresh: float = 0.5,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -56,3 +58,7 @@ class MiniMaxH3ConditionModelConfig(PretrainedConfig):
         self.training_cfg_scale = training_cfg_scale
         self.training_cfg_schedule = training_cfg_schedule
         self.training_cfg_curvature_power = training_cfg_curvature_power
+        if not math.isfinite(refinement_t_thresh) or not 0 < refinement_t_thresh <= 1:
+            raise ValueError("refinement_t_thresh must be finite and in (0, 1].")
+        self.refinement_mode = bool(refinement_mode)
+        self.refinement_t_thresh = float(refinement_t_thresh)
