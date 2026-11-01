@@ -63,7 +63,7 @@ data:
   text_keys: text
   dataloader:
     type: native
-    num_workers: 4
+    num_workers: 1
     drop_last: true
 train:
   training_task: offline_training
@@ -74,7 +74,7 @@ train:
   num_train_epochs: 1
   max_steps: 250
   checkpoint:
-    output_dir: /ai_share/zsqiao/codes/outputs/h3_refinement_lora
+    output_dir: output/h3_refinement_lora
     save_steps: 50
     save_epochs: 0
     save_hf_weights: true
