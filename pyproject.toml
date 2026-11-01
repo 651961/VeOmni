@@ -182,7 +182,7 @@ transformers-stable = [
 # is preserved because docker/CI install a concrete pin and use --locked /
 # --frozen. Concrete pins (docker/, .github/workflows/check_patchgen.yml)
 # must stay inside this range.
-required-version = ">=0.9.8,<0.13"
+required-version = ">=0.9.8,<0.14"
 
 default-groups = ["transformers-stable"]
 

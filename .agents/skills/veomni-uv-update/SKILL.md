@@ -22,7 +22,7 @@ which versions are current.
 ## Scenario 1: Update uv Version
 
 `pyproject.toml` -> `[tool.uv]` -> `required-version` is a **range**
-(e.g. `">=0.9.8,<0.13"`). Docker and CI install a **concrete** pin and run with
+(e.g. `">=0.9.8,<0.14"`). Docker and CI install a **concrete** pin and run with
 `--locked` / `--frozen`. Every concrete pin must stay inside the range.
 
 1. **Every Dockerfile that pins uv, one by one.** There is no generator; the
