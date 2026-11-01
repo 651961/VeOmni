@@ -654,9 +654,7 @@ class MiniMaxH3ConditionModel(PreTrainedModel):
             # H3 uses denoising-time t = 1 - sigma.  t'=0 is clean (t=1),
             # while t'=t_thresh is the refinement start point.
             t_video = 1.0 - float(t_prime.item())
-            timestep_id_int = int(
-                round(float(t_prime.item()) * (self._scheduler_video.num_train_timesteps - 1))
-            )
+            timestep_id_int = int(round(float(t_prime.item()) * (self._scheduler_video.num_train_timesteps - 1)))
             timestep_id_int = max(0, min(self._scheduler_video.num_train_timesteps - 1, timestep_id_int))
             ts_v = self._scheduler_video.timesteps[timestep_id_int].to(dtype=model_dtype)
             ts_a = self._scheduler_audio.timesteps[timestep_id_int].to(dtype=model_dtype)

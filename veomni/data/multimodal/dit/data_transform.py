@@ -34,6 +34,8 @@ def process_minimax_h3_online_example(example, source_name, **kwargs):
       - audio: torchaudio.load, trim/pad to int(num_frames/24 * original_sr) at
         ORIGINAL sample rate, return (waveform[C,T], sample_rate)
     """
+    import math
+
     import imageio
     import numpy as np
     import torch
@@ -145,8 +147,6 @@ def process_minimax_h3_refinement_online_example(example, source_name, **kwargs)
     input is then resized in RGB to exactly that target geometry before VAE
     encoding, matching LongCat's ``Decode -> Upsample -> Encode`` path.
     """
-    import math
-
     import imageio
     import numpy as np
     import torch
