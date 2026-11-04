@@ -117,6 +117,12 @@ Available configs:
 | Stage 2 | `configs/dit/minimax_h3_fl2va_offline.yaml` | `training_task: offline_training` |
 | Stage 2 (LoRA) | `configs/dit/minimax_h3_fl2va_lora_offline.yaml` | `training_task: offline_training` |
 
+The FL2VA LoRA recipe uses 8 FSDP shards with 2-way Ulysses on the same 8 GPUs:
+`dp_replicate_size: 1`, `dp_shard_size: 8`, `ulysses_size: 2`.
+With `micro_batch_size: 1` and `global_batch_size: 8`, four independent samples
+are processed per micro-step and two micro-steps accumulate into one update.
+Changing only this parallel layout does not require re-encoding offline data.
+
 ### Stage 1 Config (embedding)
 
 ```yaml

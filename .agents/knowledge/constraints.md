@@ -49,6 +49,7 @@ Core entry points:
    - `parallelize_model_fsdp2()` in `torch_parallelize.py` calls `fully_shard()` on each transformer block, then on the root model.
    - The FSDP mesh comes from `ParallelState.fsdp_mesh`, which is a view of the global device mesh (can be `dp_shard`, `dp_shard_sp`, or include `dp_replicate` for HSDP).
    - When SP is enabled, the FSDP shard mesh fuses with the SP mesh (`dp_shard_sp`) so sequence-parallel ranks co-shard via FSDP.
+   - `AcceleratorConfig.dp_shard_size` is the total FSDP shard degree, including SP/CP ranks. `init_parallel_state_from_config()` passes `accelerator.dp_shard_mesh_size = dp_shard_size / (ulysses_size * cp_size)` to the internal `ParallelState.dp_shard_size`, which remains the DP-only mesh axis. Use that adapter when constructing a state from config. With TP/PP disabled, `world_size = dp_replicate_size * dp_shard_size`; batch calculations still use `dp_size = world_size / sp_size`. Older explicit shard degrees with SP must be multiplied by SP size when reusing training YAMLs.
    - Gradient clipping: `veomni/distributed/fsdp2/clip_grad_norm.py` — handles DTensor grads and ExtraParallel param groups.
 
 6. **Device mesh initialization (`init_parallel_state_from_config()`)**

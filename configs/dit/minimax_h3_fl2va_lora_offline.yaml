@@ -39,7 +39,7 @@ model:
     init_device: meta
     dp_replicate_size: 1
     dp_shard_size: 8
-    ulysses_size: 1
+    ulysses_size: 2
     gradient_checkpointing:
       enable: true
     fsdp_config:
@@ -61,7 +61,7 @@ data:
   text_keys: text
   dataloader:
     type: native
-    num_workers: 4
+    num_workers: 1
     drop_last: true
 train:
   training_task: offline_training
@@ -73,7 +73,7 @@ train:
   max_steps: 250
   checkpoint:
     output_dir: output/christmas_dance_fl2va_lora
-    save_steps: 50
+    save_steps: 30
     save_epochs: 0
     save_hf_weights: true
   wandb:

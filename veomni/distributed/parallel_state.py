@@ -607,7 +607,8 @@ def _init_parallel_state(
 
     logger.info_rank0(
         f"Initializing parallel state: dp_size {dp_size}, dp_replicate_size {dp_replicate_size}, "
-        + f"dp_shard_size {dp_shard_size},tp_size {tp_size}, pp_size {pp_size}, cp_size {cp_size}, ulysses_size {ulysses_size}, "
+        + f"fsdp_shard_size {dp_shard_size * cp_size * ulysses_size}, dp_shard_mesh_size {dp_shard_size}, "
+        + f"tp_size {tp_size}, pp_size {pp_size}, cp_size {cp_size}, ulysses_size {ulysses_size}, "
         + ", ".join(
             [
                 f"{para_name}_size {para_size}"
@@ -756,7 +757,7 @@ def init_parallel_state_from_config(accelerator: "AcceleratorConfig", name: Opti
     return _init_parallel_state(
         dp_size=accelerator.dp_size,
         dp_replicate_size=accelerator.dp_replicate_size,
-        dp_shard_size=accelerator.dp_shard_size,
+        dp_shard_size=accelerator.dp_shard_mesh_size,
         tp_size=accelerator.tp_size,
         pp_size=accelerator.pp_size,
         cp_size=accelerator.cp_size,

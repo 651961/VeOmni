@@ -41,7 +41,7 @@ model:
     init_device: meta
     dp_replicate_size: 1
     dp_shard_size: 8
-    ulysses_size: 1
+    ulysses_size: 4
     gradient_checkpointing:
       enable: true
     fsdp_config:

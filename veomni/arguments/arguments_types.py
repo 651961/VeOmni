@@ -780,7 +780,9 @@ class AcceleratorConfig:
     )
     dp_shard_size: int = field(
         default=-1,
-        metadata={"help": "Data parallel shard degree."},
+        metadata={
+            "help": "Total FSDP shard degree, including Ulysses/CP ranks. -1 derives it from the world size and dp_replicate_size."
+        },
     )
     tp_size: int = field(
         default=1,
@@ -895,24 +897,37 @@ class AcceleratorConfig:
 
         self.dp_size = self.world_size // non_dp_size
 
-        # dp_replicate_size / dp_shard_size stay fields so HSDP is configurable, and
-        # are resolved in place: -1 means "derive me".
+        # The device mesh has disjoint DP and SP axes, but FSDP shards across
+        # both. Retain the total in the public config (including serialized
+        # configs), and resolve the DP-only mesh axis here.
+        sp_factor = self.ulysses_size * self.cp_size
+        if self.dp_shard_size > 0 and self.dp_shard_size % sp_factor:
+            raise ValueError(
+                f"dp_shard_size ({self.dp_shard_size}) must be divisible by the sequence parallel size "
+                f"({sp_factor}). FSDP sharding includes the sequence-parallel ranks."
+            )
         if self.dp_replicate_size > 0 and self.dp_shard_size > 0:
-            assert self.dp_size == self.dp_replicate_size * self.dp_shard_size, (
-                f"dp_size should be equal to dp_replicate_size: {self.dp_replicate_size} "
-                f"* dp_shard_size: {self.dp_shard_size}."
+            assert self.world_size == self.dp_replicate_size * self.dp_shard_size, (
+                f"world_size ({self.world_size}) should equal dp_replicate_size ({self.dp_replicate_size}) "
+                f"* dp_shard_size ({self.dp_shard_size}); dp_shard_size includes sequence-parallel ranks."
             )
         elif self.dp_replicate_size > 0:
             if self.dp_size % self.dp_replicate_size != 0:
                 raise ValueError("dp_size should be a multiple of dp_replicate_size.")
-            self.dp_shard_size = self.dp_size // self.dp_replicate_size
+            self.dp_shard_size = self.world_size // self.dp_replicate_size
         elif self.dp_shard_size > 0:
-            if self.dp_size % self.dp_shard_size != 0:
-                raise ValueError("dp_size should be a multiple of dp_shard_size.")
-            self.dp_replicate_size = self.dp_size // self.dp_shard_size
+            if self.world_size % self.dp_shard_size != 0:
+                raise ValueError("world_size should be a multiple of dp_shard_size.")
+            self.dp_replicate_size = self.world_size // self.dp_shard_size
         else:
             self.dp_replicate_size = 1
-            self.dp_shard_size = self.dp_size
+            self.dp_shard_size = self.world_size
+
+    @property
+    def dp_shard_mesh_size(self) -> int:
+        """DP-only mesh axis; FSDP fuses it with the sequence-parallel axes."""
+        sp_factor = self.ulysses_size * self.cp_size
+        return self.dp_shard_size // sp_factor
 
     def _validate_init_device(self):
         if self.fsdp_config.fsdp_mode == "fsdp2":
@@ -1937,9 +1952,7 @@ class ModelArguments(BaseModelArguments):
         extra_parallel_sizes = dict(zip(self.accelerator.extra_parallel_names, self.accelerator.extra_parallel_sizes))
         ple_size = extra_parallel_sizes.get("ple", 1)
         if ple_size > 1:
-            effective_fsdp_shard_size = (
-                self.accelerator.dp_shard_size * self.accelerator.ulysses_size * self.accelerator.cp_size
-            )
+            effective_fsdp_shard_size = self.accelerator.dp_shard_size
             if effective_fsdp_shard_size % ple_size != 0:
                 raise ValueError(
                     f"PLE size ({ple_size}) must divide the effective FSDP shard size ({effective_fsdp_shard_size})."

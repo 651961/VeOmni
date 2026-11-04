@@ -77,7 +77,7 @@ data:
 train:
   training_task: offline_embedding
 
-  global_batch_size: 1
+  global_batch_size: 8
   micro_batch_size: 1
   dyn_bsz: false
 

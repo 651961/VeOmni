@@ -48,7 +48,7 @@ data:
     fps: 24
     min_frames: 124
     max_frames: 124
-    video_max_pixels: 4177920
+    video_max_pixels: 2097152
     keyframe_indices: [0]
   offline_embedding_save_dir: /ai_share/zsqiao/codes/video_gen/VeOmni/dataset/h3_refinement_embedding
 

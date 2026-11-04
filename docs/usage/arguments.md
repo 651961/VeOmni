@@ -669,10 +669,25 @@ surrounding `TrainingArguments` required. `world_size` and `dp_size` are exposed
 as plain attributes rather than fields, so they are derived rather than
 configured and never round-trip through a saved config.
 
+`dp_shard_size` counts the full FSDP shard group, including sequence-parallel
+ranks. With TP/PP disabled, `WORLD_SIZE = dp_replicate_size * dp_shard_size`,
+while `dp_size = WORLD_SIZE / (ulysses_size * cp_size)` counts distinct samples.
+The internal DP-only mesh axis is `dp_shard_mesh_size = dp_shard_size /
+(ulysses_size * cp_size)`; FSDP fuses that axis with SP. For example, 8 GPUs can
+use `dp_replicate_size: 1`, `dp_shard_size: 8`, and `ulysses_size: 2` together.
+The same 8 ranks shard parameters, and four groups of two ranks split sequences.
+
+Migration: older configurations counted only the DP mesh axis in
+`dp_shard_size`. If it was explicitly set with SP enabled, multiply the old
+value by `ulysses_size * cp_size` to retain the same topology. Configurations
+using `dp_shard_size: -1` or no SP need no changes. This also applies to saved
+training YAMLs when reusing them; distributed checkpoint shard layouts stay the
+same when the resulting mesh is unchanged.
+
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| dp_replicate_size | `int` | `-1` | HSDP replicate degree for both dense and MoE parameters. `-1` derives it from `dp_size` and `dp_shard_size`. |
-| dp_shard_size | `int` | `-1` | HSDP shard degree. `-1` derives it from `dp_size` and `dp_replicate_size`. Setting neither gives pure sharding (`dp_replicate_size=1`). |
+| dp_replicate_size | `int` | `-1` | HSDP replicate degree for both dense and MoE parameters. `-1` derives it from `WORLD_SIZE` and `dp_shard_size`. |
+| dp_shard_size | `int` | `-1` | Total FSDP shard degree, including SP/CP ranks; must be divisible by `ulysses_size * cp_size`. `-1` derives it from `WORLD_SIZE` and `dp_replicate_size`. Setting neither gives pure sharding (`dp_replicate_size=1`). |
 | tp_size | `int` | `1` | Tensor parallel size. |
 | ep_size | `int` | `1` | Expert parallel size, should be fit into dp_shard group if HSDP enabled |
 | ep_outside | `bool` | `False` | Expert parallelism outside in EP-FSDP. |

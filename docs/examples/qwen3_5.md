@@ -328,14 +328,16 @@ distributing the sequence across multiple GPUs.
 To enable Ulysses SP, set `model.accelerator.ulysses_size`. VeOmni derives the effective
 data-parallel size from the world size and the other parallel dimensions; set
 `model.accelerator.dp_shard_size` only when you need to pin the FSDP shard degree explicitly.
-For the example below, the total GPU count is `dp_shard_size * ulysses_size = 4 * 2 = 8`.
+For the example below, FSDP shards across all 8 GPUs (`dp_shard_size=8`),
+while Ulysses splits each sample across 2 of those GPUs (`ulysses_size=2`).
+The data-parallel size is 4.
 
 ```shell
 # Example: 8 GPUs, dp=4, sp=2
 bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
     --model.model_path ${HOME}/Qwen3.5-9B \
     --data.train_path ${HOME}/tulu-first2000.parquet \
-    --model.accelerator.dp_shard_size 4 \
+    --model.accelerator.dp_shard_size 8 \
     --model.accelerator.ulysses_size 2 \
     --model.ops_implementation.attn_implementation flash_attention_3
 ```
